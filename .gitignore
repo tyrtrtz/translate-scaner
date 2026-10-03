@@ -14,3 +14,4 @@ outputs/
 *.xlsb
 *.csv
 ignored_sheets.json
+settings.json

@@ -10,7 +10,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
 
 from ignored_sheets import sheet_key
-from matcher import match_folder
+from matcher import match_folder, write_detail_sheet
 from scanner import scan_folder
 
 
@@ -230,6 +230,7 @@ class TranslationMatches(unittest.TestCase):
         book.active["R2"].font = Font(italic=True)  # Empty styled cell must not duplicate the new R2.
         book.save(baseline)
         book.close()
+
         with ZipFile(baseline) as archive:
             parts = {name: archive.read(name) for name in archive.namelist()}
         xml = parts['xl/worksheets/sheet1.xml'].decode()
@@ -256,6 +257,76 @@ class TranslationMatches(unittest.TestCase):
         self.assertEqual(book.active['AA2'].value, 1)
         self.assertEqual(book.active['A2'].value, '=1+1')
         book.close()
+
+    def test_complete_details_missing_and_conflicts_keep_all_candidates(self):
+        path = self.write_source([
+            ["重复","韩语甲"], ["重复",None], ["首尾一致"," 번역 "], ["首尾一致","번역"],
+            ["单一缺译"," \t "], ["四条","韩1"], ["四条","韩1"], ["四条","韩2"], ["四条",None],
+            ["不在基准",None], ["不在基准","例1"], ["不在基准","例2"],
+        ], name="A.xlsx")
+        self.write_source([["重复","韩语乙"]], name="B.xlsx")
+        book = load_workbook(path)
+        ignored = book.create_sheet("忽略")
+        ignored.append(["台词","韩文"])
+        ignored.append(["重复","不应算冲突"])
+        ignored.append(["单一缺译",None])
+        invalid = book.create_sheet("异常")
+        invalid.append(["台词"])
+        invalid.append(["重复","不应算冲突"])
+        book.save(path)
+        book.close()
+        exclusions = {sheet_key(path, "忽略")}
+        self.write_baseline(["重复","首尾一致","单一缺译","四条","未找到"])
+        self.write_baseline(["重复"], name="char.xlsx")
+        report = scan_folder(self.source, 1, ignored_sheets=exclusions)
+        result = match_folder(report, self.baseline, self.output, ignored_sheets=exclusions)
+        self.assertEqual((result.source_rows,result.source_matched,result.missing_translations,result.conflict_texts,result.match_pairs), (13,10,4,3,13))
+        book = load_workbook(result.destination / "基准匹配结果/story.xlsx")
+        sheet = book.active
+        self.assertEqual([(sheet.cell(r,27).value,sheet.cell(r,28).value,sheet.cell(r,29).value) for r in range(2,7)],
+                         [(3,1,"是"),(2,0,"否"),(1,1,"否"),(4,1,"是"),(0,0,"未匹配")])
+        self.assertTrue(all(sheet.cell(5,c).value is None for c in range(18,27)))
+        book.close()
+        book = load_workbook(result.destination / "匹配明细.xlsx")
+        matched = list(book["匹配明细"].values)[1:]
+        self.assertEqual(len(matched),13)
+        repeat = [r for r in matched if r[8]=="重复"]
+        self.assertEqual(len(repeat),6)
+        self.assertEqual({r[0] for r in repeat},{"story.xlsx","char.xlsx"})
+        self.assertTrue(all(r[11]=="是" for r in repeat))
+        self.assertFalse(any(r[6] in ("忽略","异常") for r in matched))
+        unmatched = list(book["未匹配明细"].values)[1:]
+        self.assertEqual(len(unmatched),3)
+        self.assertEqual({r[4] for r in unmatched},{"不在基准"})
+        self.assertEqual({r[3] for r in unmatched},{11,12,13})
+        missing = list(book["缺译明细"].values)[1:]
+        self.assertEqual(len(missing),4)
+        self.assertEqual(sum(r[6]=="否" for r in missing),1)
+        conflicts = list(book["译文冲突"].values)[1:]
+        self.assertEqual({r[4] for r in conflicts},{"重复","四条","不在基准"})
+        self.assertTrue(all(r[8]==2 for r in conflicts))
+        self.assertEqual(len(conflicts),10)
+        self.assertEqual(book["匹配明细"].freeze_panes,"A2")
+        book.close()
+        book = load_workbook(result.destination / "源文件匹配统计.xlsx")
+        rows = list(book["文件统计"].values)[1:]
+        self.assertEqual([(r[0],r[9],r[10]) for r in rows],[("A.xlsx",4,3),("B.xlsx",0,1)])
+        book.close()
+
+    def test_details_split_at_sheet_limit_without_losing_rows(self):
+        book = Workbook(write_only=True)
+        count = write_detail_sheet(book,"明细",["中文"],[("=原文",),("第二行",),("第三行",),("第四行",),("第五行",)],[30],row_limit=3)
+        path = self.root / "分页.xlsx"
+        book.save(path)
+        book.close()
+        self.assertEqual(count,5)
+        book = load_workbook(path)
+        self.assertEqual(book.sheetnames,["明细","明细_2","明细_3"])
+        self.assertEqual([row[0] for sheet in book for row in list(sheet.values)[1:]], ["=原文","第二行","第三行","第四行","第五行"])
+        self.assertEqual(book["明细"]["A2"].data_type,"s")
+        self.assertTrue(all(s.max_row<=3 for s in book))
+        book.close()
+
 
 
 if __name__ == "__main__":

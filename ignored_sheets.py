@@ -48,14 +48,19 @@ def load_ignored(path=None):
 
 def save_ignored(records, path=None):
     path = Path(path) if path is not None else default_ignore_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
     data = {"version": 1, "sheets": [
         {"file": filename, "sheet": sheet} for filename, sheet in sorted(records)
     ]}
+    write_json(data, path, prefix="ignored_")
+
+
+def write_json(data, path, prefix="settings_"):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
-                                         prefix="ignored_", suffix=".tmp", delete=False) as stream:
+                                         prefix=prefix, suffix=".tmp", delete=False) as stream:
             temporary = Path(stream.name)
             json.dump(data, stream, ensure_ascii=False, indent=2)
             stream.write("\n")

@@ -6,7 +6,7 @@ import tempfile
 import shutil
 import re
 from zipfile import ZipFile
-from xml.sax import make_parser
+from xml.sax.expatreader import create_parser
 from xml.sax.handler import feature_external_ges
 from xml.sax.saxutils import XMLGenerator
 from dataclasses import dataclass
@@ -174,7 +174,7 @@ def write_baseline_copy(path, destination, connection, sheets):
             with source.open(item) as original, output.open(item, "w") as copied:
                 if item.filename in sheets:
                     writer = BaselineWriter(copied, connection, path, sheets[item.filename])
-                    parser = make_parser()
+                    parser = create_parser()
                     parser.setFeature(feature_external_ges, False)
                     parser.setContentHandler(writer)
                     parser.parse(original)
@@ -351,7 +351,8 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                     if book is not None:
                         book.close()
             if not sheet_rows:
-                raise ValueError("所有候选 Sheet 正文读取失败，未生成匹配结果")
+                failures = [f"{r.path.name} / {r.sheet}：{r.issue}" for results in candidates.values() for r in results if r.issue]
+                raise ValueError("所有候选 Sheet 正文读取失败，未生成匹配结果：\n" + "\n".join(failures[:10]))
             connection.executescript("CREATE TABLE counts AS SELECT text, COUNT(*) AS n FROM hits GROUP BY text; CREATE UNIQUE INDEX count_text ON counts(text);")
             outputs = []
             for path in baselines:

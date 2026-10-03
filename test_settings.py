@@ -21,7 +21,7 @@ class SavedSettings(unittest.TestCase):
                       chinese_headers=["自定义中文"], korean_headers=["번역"])
         save_settings(values, self.path)
         self.assertEqual(load_settings(self.path), values)
-        self.assertIn("客户 한국어", self.path.read_text())
+        self.assertIn("客户 한국어", self.path.read_text(encoding="utf-8"))
 
     def test_invalid_values_never_replace_saved_settings(self):
         values = default_settings()
@@ -40,10 +40,10 @@ class SavedSettings(unittest.TestCase):
     def test_corrupt_settings_are_reported_and_not_overwritten(self):
         self.path.parent.mkdir()
         for data in ("{broken", json.dumps({"version":1,"rows":"10"}), "[]"):
-            self.path.write_text(data)
+            self.path.write_text(data, encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "本地设置格式无效"):
                 load_settings(self.path)
-            self.assertEqual(self.path.read_text(), data)
+            self.assertEqual(self.path.read_text(encoding="utf-8"), data)
 
 
 if __name__ == "__main__":

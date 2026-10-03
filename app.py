@@ -12,6 +12,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from scanner import CHINESE_HEADERS, KOREAN_HEADERS, export_exceptions, scan_folder
 from ignored_sheets import default_ignore_file, load_ignored, save_ignored, sheet_key
+from matcher import match_folder
 
 
 def open_path(path):
@@ -92,6 +93,7 @@ class Application:
         self.root = root
         self.report = None
         self.running = False
+        self.match_report = None
         self.events = queue.Queue()
         self.ignore_file = Path(ignore_file) if ignore_file is not None else default_ignore_file()
         self.ignore_error = ""
@@ -101,13 +103,13 @@ class Application:
             self.ignored = set()
             self.ignore_error = str(error)
         root.title("中韩表头检查")
-        root.geometry("1100x650")
+        root.geometry("1100x760")
         root.minsize(820, 520)
         root.protocol("WM_DELETE_WINDOW", self.close)
         frame = ttk.Frame(root, padding=16)
         frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="第一步：检查源文件表头", font=("", 18, "bold")).pack(anchor="w")
-        ttk.Label(frame, text="包含子文件夹、隐藏工作表和隐藏行。仅检查表头，不修改源文件。").pack(anchor="w", pady=(6, 14))
+        ttk.Label(frame, text="中韩译文检索", font=("", 18, "bold")).pack(anchor="w")
+        ttk.Label(frame, text="第一步检查表头，第二步检索译文。扫描范围可调整；结果写入副本。").pack(anchor="w", pady=(6, 14))
 
         folder_row = ttk.Frame(frame)
         folder_row.pack(fill="x")
@@ -134,6 +136,16 @@ class Application:
         self.rows = tk.StringVar(value="10")
         self.row_entry = ttk.Entry(settings, textvariable=self.rows, width=10)
         self.row_entry.grid(row=1, column=2, sticky="w", padx=8, pady=(10, 0))
+        options = ttk.Frame(settings)
+        options.grid(row=2, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        self.recursive = tk.BooleanVar(value=True)
+        self.include_hidden_sheets = tk.BooleanVar(value=True)
+        self.include_hidden_rows = tk.BooleanVar(value=True)
+        self.scan_switches = []
+        for title, variable in (("扫描子文件夹", self.recursive), ("扫描隐藏工作表", self.include_hidden_sheets), ("扫描隐藏行", self.include_hidden_rows)):
+            switch = ttk.Checkbutton(options, text=title, variable=variable)
+            switch.pack(side="left", padx=(0, 24))
+            self.scan_switches.append(switch)
 
         actions = ttk.Frame(frame)
         actions.pack(fill="x")
@@ -200,6 +212,29 @@ class Application:
         horizontal.grid(row=1, column=0, sticky="ew")
         ignored_frame.rowconfigure(0, weight=1)
         ignored_frame.columnconfigure(0, weight=1)
+        self.match_tab = ttk.Frame(self.tabs, padding=12)
+        self.tabs.add(self.match_tab, text="第二步：译文检索")
+        self.baseline_folder = tk.StringVar()
+        self.output_folder = tk.StringVar()
+        self.match_inputs = []
+        for label, variable in (("基准文件夹", self.baseline_folder), ("输出文件夹", self.output_folder)):
+            line = ttk.Frame(self.match_tab)
+            line.pack(fill="x", pady=4)
+            ttk.Label(line, text=label, width=12).pack(side="left")
+            entry = ttk.Entry(line, textvariable=variable)
+            entry.pack(side="left", fill="x", expand=True, padx=8)
+            button = ttk.Button(line, text="选择文件夹", command=lambda v=variable, t=label: self.browse_match(v, t))
+            button.pack(side="left")
+            self.match_inputs.extend((entry, button))
+        ttk.Label(self.match_tab, text="先完成第一步检查；已忽略及异常 Sheet 自动跳过。\n按 G 列 Text 检索，中文去除首尾空白后全文匹配。1～3 条展开，超过 3 条只写条数。\n基准原件不改动，副本 R～Z 写三组中韩文本及来源，AA 写匹配条数。", wraplength=980).pack(anchor="w", pady=8)
+        line = ttk.Frame(self.match_tab)
+        line.pack(fill="x")
+        self.match_button = ttk.Button(line, text="开始检索并生成结果", command=self.start_match, state="disabled")
+        self.match_button.pack(side="left")
+        self.match_open_button = ttk.Button(line, text="打开结果文件夹", command=self.open_match_output, state="disabled")
+        self.match_open_button.pack(side="left", padx=8)
+        self.match_summary = tk.StringVar(value="请先检查源文件表头，再选择 0_基准文件 和单独的输出文件夹。")
+        ttk.Label(self.match_tab, textvariable=self.match_summary, wraplength=980, justify="left").pack(anchor="w", pady=10)
         for table in (self.table, self.ignored_table):
             table.bind("<<ChecksChanged>>", lambda event: self.set_running(self.running))
         self.refresh_ignored()
@@ -216,7 +251,7 @@ class Application:
 
     def set_running(self, running):
         self.running = running
-        for widget in (self.start_button, self.browse_button, self.folder_entry, self.row_entry):
+        for widget in (self.start_button, self.browse_button, self.folder_entry, self.row_entry, *self.match_inputs, *self.scan_switches):
             widget.configure(state="disabled" if running else "normal")
         if self.ignore_error:
             self.start_button.configure(state="disabled")
@@ -227,6 +262,57 @@ class Application:
         self.open_button.configure(state="normal" if available and self.report.exceptions else "disabled")
         self.ignore_button.configure(state="normal" if available and self.table.checked_items() and not self.ignore_error else "disabled")
         self.restore_button.configure(state="normal" if not running and self.ignored_table.checked_items() and not self.ignore_error else "disabled")
+        self.match_button.configure(state="normal" if available and self.report.passed_sheets and not self.ignore_error else "disabled")
+        self.match_open_button.configure(state="normal" if not running and self.match_report else "disabled")
+
+    def browse_match(self, variable, title):
+        folder = filedialog.askdirectory(title=f"选择{title}")
+        if folder:
+            variable.set(folder)
+
+    def start_match(self):
+        if self.running or self.report is None or self.ignore_error:
+            return
+        try:
+            from scanner import normalize
+            current = (Path(self.folder.get().strip()).expanduser().resolve(), int(self.rows.get()),
+                       {normalize(v) for v in self.chinese.get("1.0", "end").splitlines() if normalize(v)},
+                       {normalize(v) for v in self.korean.get("1.0", "end").splitlines() if normalize(v)},
+                       self.recursive.get(), self.include_hidden_sheets.get(), self.include_hidden_rows.get())
+            expected = (self.report.root, self.report.header_rows, set(self.report.chinese_headers), set(self.report.korean_headers),
+                        self.report.recursive, self.report.include_hidden_sheets, self.report.include_hidden_rows)
+            if current != expected:
+                raise ValueError("源文件夹或检查规则已改变，请先重新执行第一步检查")
+            baseline = self.baseline_folder.get().strip()
+            output = self.output_folder.get().strip()
+            if not baseline or not output:
+                raise ValueError("请选择基准文件夹和输出文件夹")
+        except ValueError as error:
+            messagebox.showerror("无法开始检索", str(error))
+            return
+        report, ignored, events = self.report, set(self.ignored), self.events
+        self.match_report = None
+        self.match_summary.set("正在检索，完成后显示结果位置。")
+        self.set_running(True)
+        self.progress.configure(mode="indeterminate")
+        self.progress.start(15)
+
+        def work():
+            try:
+                result = match_folder(report, baseline, output, ignored_sheets=ignored,
+                                      progress=lambda text: events.put(("match_progress", text)))
+                events.put(("match_done", result))
+            except Exception as error:
+                events.put(("match_error", str(error)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def open_match_output(self):
+        if self.match_report:
+            try:
+                open_path(self.match_report.destination)
+            except OSError as error:
+                messagebox.showerror("无法打开结果文件夹", str(error))
 
     def start(self):
         if self.running or self.ignore_error:
@@ -250,13 +336,15 @@ class Application:
         self.progress.configure(value=0, maximum=1)
         self.status.set("正在查找 Excel 文件……")
         ignored = set(self.ignored)
+        scan_options = dict(recursive=self.recursive.get(), include_hidden_sheets=self.include_hidden_sheets.get(),
+                            include_hidden_rows=self.include_hidden_rows.get())
         events = self.events
 
         def work():
             try:
                 report = scan_folder(folder, rows, chinese, korean,
                                      progress=lambda i, total, path: events.put(("progress", (i, total, path))),
-                                     ignored_sheets=ignored)
+                                     ignored_sheets=ignored, **scan_options)
                 events.put(("done", report))
             except Exception as error:
                 events.put(("error", str(error)))
@@ -280,6 +368,25 @@ class Application:
                     self.set_running(False)
                     self.status.set("检查未完成，请处理错误后重试。")
                     messagebox.showerror("检查失败", value)
+                elif kind == "match_progress":
+                    self.status.set(value)
+                elif kind in ("match_done", "match_error"):
+                    self.progress.stop()
+                    self.progress.configure(mode="determinate", value=0)
+                    if kind == "match_done":
+                        self.match_report = value
+                        self.report = value.check_report
+                        self.refresh_exceptions()
+                        summary = (f"检索完成：基准 {value.baseline_rows} 行，匹配 {value.matched_rows} 行；"
+                                   f"源文件参与 {value.source_rows} 行，匹配 {value.source_matched} 行；跳过 {value.skipped} 项。\n"
+                                   f"结果位置：{value.destination}\n基准匹配副本位于“基准匹配结果”子文件夹；统计与跳过原因见“源文件匹配统计.xlsx”。")
+                        self.match_summary.set(summary)
+                        self.status.set(summary.split("\n")[0])
+                    else:
+                        self.match_summary.set("检索失败，未生成本次结果。请处理错误后重试。")
+                        self.status.set("检索未完成。")
+                        messagebox.showerror("检索失败", value)
+                    self.set_running(False)
         except queue.Empty:
             pass
         self.root.after(100, self.poll)
@@ -291,7 +398,7 @@ class Application:
         report = self.report
         for index, result in enumerate(report.exceptions):
             self.table.insert("", "end", iid=str(index), values=(str(result.path.relative_to(report.root)), result.sheet, result.issue, result.chinese, result.korean))
-        self.status.set(f"已检查 {report.files} 个文件；{report.passed_sheets} 张表通过；{report.abnormal_files} 个文件需确认，共 {len(report.exceptions)} 项异常；已忽略 {report.ignored_sheets} 张表。")
+        self.status.set(f"已检查 {report.files} 个文件；{report.passed_sheets} 张表通过；{report.abnormal_files} 个文件需确认，共 {len(report.exceptions)} 项异常；已忽略 {report.ignored_sheets} 张表；按开关跳过 {len(report.skipped_sheets)} 张表。")
 
     def refresh_ignored(self):
         self.ignored_table.delete(*self.ignored_table.get_children())
@@ -398,7 +505,7 @@ class Application:
 
     def close(self):
         if self.running:
-            messagebox.showinfo("正在检查", "请等待检查结束后关闭窗口。")
+            messagebox.showinfo("正在处理", "请等待检查或检索结束后关闭窗口。")
         else:
             self.root.destroy()
 

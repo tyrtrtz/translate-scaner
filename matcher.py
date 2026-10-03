@@ -1,0 +1,381 @@
+"""Match approved source sheets using a disk index; save baseline copies only."""
+
+import os
+import sqlite3
+import tempfile
+import shutil
+import re
+from zipfile import ZipFile
+from xml.sax import make_parser
+from xml.sax.handler import feature_external_ges
+from xml.sax.saxutils import XMLGenerator
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+from ignored_sheets import sheet_key
+from scanner import SUPPORTED, hidden_row_numbers, scan_folder
+
+
+def match_key(value):
+    return value.strip() if isinstance(value, str) else ""
+
+
+def text_cell(sheet, row, column, value):
+    cell = sheet.cell(row, column, value)
+    if isinstance(value, str):
+        cell.data_type = "s"  # A source string beginning with '=' is text, never a formula.
+    return cell
+
+
+@dataclass
+class MatchReport:
+    destination: Path
+    check_report: object
+    baseline_rows: int
+    matched_rows: int
+    source_rows: int
+    source_matched: int
+    skipped: int
+    outputs: list
+
+
+def baseline_sheets(workbook, path):
+    for sheet in workbook:
+        if hasattr(sheet, "reset_dimensions"):
+            sheet.reset_dimensions()
+        if sheet.cell(1, 7).value != "Text":
+            raise ValueError(f"基准格式不符：{path.name} / {sheet.title} 的 G1 必须为 Text")
+        yield sheet
+
+
+class BaselineWriter(XMLGenerator):
+    """Stream original worksheet XML unchanged in meaning, adding R:AA cells."""
+
+    def __init__(self, stream, connection, path, sheet):
+        super().__init__(stream, encoding="utf-8", short_empty_elements=True)
+        self.connection, self.path, self.sheet = connection, str(path), sheet
+        self.row = None
+        self.protected_cell = False
+        self.protected_value = False
+        self.prefix = ""
+        self.omit_dimension = False
+        self.has_columns = False
+        self.matched_rows = 0
+
+    def startElement(self, name, attrs):
+        local = name.rsplit(":", 1)[-1]
+        if local == "worksheet":
+            self.prefix = name[:-len(local)]
+        if local == "dimension":
+            # Optional metadata can be wrong in the customer's baseline files.
+            # Without it readers determine dimensions from the actual cells.
+            self.omit_dimension = True
+            return
+        if local == "cols":
+            self.has_columns = True
+        if local == "sheetData" and not self.has_columns:
+            super().startElement(self.prefix + "cols", {})
+            self.output_columns()
+            super().endElement(self.prefix + "cols")
+        if local == "row":
+            self.row = int(attrs["r"])
+        if local == "c":
+            column = re.match(r"[A-Z]+", attrs.get("r", "")).group()
+            self.protected_cell = column in {get_column_letter(c) for c in range(18, 28)}
+        if self.protected_cell and local == "f":
+            self.existing_content()
+        if self.protected_cell and local in ("v", "t"):
+            self.protected_value = True
+        if self.protected_cell:
+            return
+        super().startElement(name, attrs)
+
+    def characters(self, content):
+        if self.protected_cell and self.protected_value and content:
+            self.existing_content()
+        if not self.omit_dimension and not self.protected_cell:
+            super().characters(content)
+
+    def existing_content(self):
+        raise ValueError(f"{Path(self.path).name} / {self.sheet} 的 R～AA 列已有内容，请提供未回填的基准文件")
+
+    def output_columns(self):
+        for first, last, width in ((18, 26, 45), (27, 27, 16)):
+            super().startElement(self.prefix + "col", {"min": str(first), "max": str(last), "width": str(width), "customWidth": "1"})
+            super().endElement(self.prefix + "col")
+
+    def output_cell(self, column, value):
+        if value is None:
+            return
+        attrs = {"r": f"{get_column_letter(column)}{self.row}"}
+        if isinstance(value, str):
+            attrs["t"] = "inlineStr"
+        super().startElement(self.prefix + "c", attrs)
+        if isinstance(value, str):
+            super().startElement(self.prefix + "is", {})
+            super().startElement(self.prefix + "t", {"xml:space": "preserve"})
+            super().characters(value)
+            super().endElement(self.prefix + "t")
+            super().endElement(self.prefix + "is")
+        else:
+            super().startElement(self.prefix + "v", {})
+            super().characters(str(value))
+            super().endElement(self.prefix + "v")
+        super().endElement(self.prefix + "c")
+
+    def endElement(self, name):
+        local = name.rsplit(":", 1)[-1]
+        if local == "dimension":
+            self.omit_dimension = False
+            return
+        if local in ("v", "t"):
+            self.protected_value = False
+        if local == "c":
+            omitted = self.protected_cell
+            self.protected_cell = False
+            if omitted:
+                return
+        if self.protected_cell:
+            return
+        if local == "cols":
+            self.output_columns()
+        if local == "row":
+            if self.row == 1:
+                for column in range(18, 27):
+                    title = ("匹配中文", "匹配韩语", "来源路径 / Sheet / 行号")[(column - 18) % 3]
+                    self.output_cell(column, f"{title}{(column - 18) // 3 + 1}")
+                self.output_cell(27, "匹配条数")
+            else:
+                key = self.connection.execute("SELECT text FROM baseline_rows WHERE path=? AND sheet=? AND row=?",
+                                              (self.path, self.sheet, self.row)).fetchone()
+                if key:
+                    count = self.connection.execute("SELECT n FROM counts WHERE text=?", key).fetchone()
+                    count = count[0] if count else 0
+                    self.matched_rows += bool(count)
+                    if 0 < count <= 3:
+                        hits = self.connection.execute("SELECT chinese,korean,path,sheet,row FROM hits WHERE text=? ORDER BY rowid LIMIT 3", key)
+                        for index, (chinese, korean, filename, title, number) in enumerate(hits):
+                            for offset, value in enumerate((chinese, korean, f"{filename}；Sheet：{title}；行号：{number}")):
+                                self.output_cell(18 + index * 3 + offset, value)
+                    self.output_cell(27, count)
+            self.row = None
+        super().endElement(name)
+
+
+def write_baseline_copy(path, destination, connection, sheets):
+    matched = 0
+    with ZipFile(path) as source, ZipFile(destination, "w") as output:
+        for item in source.infolist():
+            with source.open(item) as original, output.open(item, "w") as copied:
+                if item.filename in sheets:
+                    writer = BaselineWriter(copied, connection, path, sheets[item.filename])
+                    parser = make_parser()
+                    parser.setFeature(feature_external_ges, False)
+                    parser.setContentHandler(writer)
+                    parser.parse(original)
+                    matched += writer.matched_rows
+                else:
+                    shutil.copyfileobj(original, copied, length=1024 * 1024)
+    return matched
+
+
+def write_statistics(destination, file_rows, sheet_rows, skipped):
+    book = Workbook()
+    book.remove(book.active)
+    for title, headers, rows, widths in (
+        ("文件统计", ["文件名", "完整路径", "参与 Sheet 数", "跳过 Sheet / 文件项数", "非空中文行数", "匹配行数", "未匹配行数", "匹配率", "处理状态"], file_rows, [38, 70, 18, 24, 18, 18, 18, 16, 24]),
+        ("Sheet统计", ["文件名", "完整路径", "Sheet", "非空中文行数", "匹配行数", "未匹配行数", "匹配率"], sheet_rows, [38, 70, 30, 18, 18, 18, 16]),
+        ("跳过清单", ["文件名", "完整路径", "Sheet", "跳过原因"], skipped, [38, 70, 30, 85]),
+    ):
+        sheet = book.create_sheet(title)
+        for row_number, values in enumerate([headers, *rows], 1):
+            for column, value in enumerate(values, 1):
+                cell = text_cell(sheet, row_number, column, value)
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                if row_number == 1:
+                    cell.font = Font(bold=True, color="FFFFFF")
+                    cell.fill = PatternFill("solid", fgColor="245B78")
+                elif headers[column - 1] == "匹配率":
+                    cell.number_format = "0.00%"
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        sheet.row_dimensions[1].height = 30
+        for column, width in enumerate(widths, 1):
+            sheet.column_dimensions[get_column_letter(column)].width = width
+    book.save(destination)
+    book.close()
+
+
+def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress=None):
+    baseline_root = Path(baseline_root).expanduser().resolve()
+    output_root = Path(output_root).expanduser().resolve()
+    source_root = report.root.resolve()
+    if not baseline_root.is_dir():
+        raise ValueError("请选择存在的基准文件夹")
+    if source_root == baseline_root or source_root in baseline_root.parents or baseline_root in source_root.parents:
+        raise ValueError("基准文件夹和源文件夹必须分开，不能互相包含")
+    if any(output_root == root or root in output_root.parents for root in (source_root, baseline_root)):
+        raise ValueError("输出文件夹不能位于源文件夹或基准文件夹内，以免再次扫描结果")
+    baselines = sorted(p for p in baseline_root.rglob("*") if p.is_file()
+                       and p.suffix.lower() in SUPPORTED and not p.name.startswith("~$"))
+    if not baselines:
+        raise ValueError("基准文件夹中没有 .xlsx 或 .xlsm 文件")
+    ignored = set(ignored_sheets)
+    previous_exceptions = {sheet_key(r.path, r.sheet): r for r in report.exceptions}
+    # Recheck at execution time so changed/new sheets cannot bypass validation.
+    fresh = scan_folder(source_root, report.header_rows, report.chinese_headers,
+                        report.korean_headers, ignored_sheets=ignored,
+                        recursive=report.recursive, include_hidden_sheets=report.include_hidden_sheets,
+                        include_hidden_rows=report.include_hidden_rows,
+                        progress=lambda i, n, p: progress(f"复查表头 {i}/{n}：{p.name}") if progress else None)
+    candidates, skipped = {}, []
+    for result in fresh.skipped_sheets:
+        skipped.append([result.path.name, str(result.path), result.sheet, result.issue])
+    for index, result in enumerate(fresh.results):
+        key = sheet_key(result.path, result.sheet)
+        if key in previous_exceptions:
+            if result.passed:
+                result = previous_exceptions[key]
+                fresh.results[index] = result
+        if result.passed and sheet_key(result.path, "") in previous_exceptions:
+            result.issue = previous_exceptions[sheet_key(result.path, "")].issue
+        if result.passed and sheet_key(result.path, "") not in previous_exceptions:
+            candidates.setdefault(result.path, []).append(result)
+        else:
+            reason = result.issue or previous_exceptions[sheet_key(result.path, "")].issue
+            skipped.append([result.path.name, str(result.path), result.sheet, "异常：" + reason])
+    # Include only ignore records that actually exist in this source folder.
+    for path in fresh.file_paths:
+        records = [sheet for filename, sheet in ignored if filename == sheet_key(path, "")[0]]
+        if records:
+            try:
+                book = load_workbook(path, read_only=True, keep_links=False)
+                try:
+                    for sheet in book.sheetnames:
+                        if sheet_key(path, sheet) in ignored:
+                            skipped.append([path.name, str(path), sheet, "本地已忽略"])
+                finally:
+                    book.close()
+            except Exception:
+                pass  # File-level read errors already appear in the header report.
+    if not candidates:
+        raise ValueError("没有可参与匹配的 Sheet；请先检查表头并处理异常或调整忽略记录")
+    output_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="匹配临时_", dir=output_root) as temporary:
+        staging = Path(temporary)
+        connection = sqlite3.connect(staging / "index.sqlite3")
+        baseline_rows = matched_rows = 0
+        sheet_rows = []
+        try:
+            connection.executescript("""
+                CREATE TABLE targets (text TEXT PRIMARY KEY);
+                CREATE TABLE baseline_rows (path TEXT, sheet TEXT, row INTEGER, text TEXT, PRIMARY KEY (path, sheet, row));
+                CREATE TABLE hits (text TEXT, chinese TEXT, korean TEXT, path TEXT, sheet TEXT, row INTEGER);
+                CREATE INDEX hit_text ON hits(text);
+            """)
+            baseline_parts = {}
+            for path in baselines:
+                if progress:
+                    progress(f"读取基准中文：{path.name}")
+                book = load_workbook(path, read_only=True, data_only=False, keep_links=False)
+                try:
+                    for sheet in baseline_sheets(book, path):
+                        baseline_parts.setdefault(path, {})[sheet._worksheet_path.lstrip("/")] = sheet.title
+                        for row in sheet.iter_rows(min_row=2, min_col=7, max_col=7):
+                            cell = row[0]
+                            if cell.data_type == "f":
+                                raise ValueError(f"基准中文不能是公式：{path.name} / {sheet.title} / {cell.coordinate}")
+                            key = match_key(cell.value)
+                            if key:
+                                baseline_rows += 1
+                                connection.execute("INSERT OR IGNORE INTO targets VALUES (?)", (key,))
+                                connection.execute("INSERT INTO baseline_rows VALUES (?,?,?,?)", (str(path), sheet.title, cell.row, key))
+                finally:
+                    book.close()
+            if not baseline_rows:
+                raise ValueError("基准文件 G 列没有非空中文文本")
+            connection.commit()
+            for index, (path, results) in enumerate(candidates.items(), 1):
+                if progress:
+                    progress(f"检索源文件 {index}/{len(candidates)}：{path.name}")
+                book = None
+                try:
+                    book = load_workbook(path, read_only=True, data_only=False, keep_links=False)
+                    for result in results:
+                        connection.execute("SAVEPOINT sheet")
+                        try:
+                            sheet = book[result.sheet]
+                            sheet.reset_dimensions()
+                            hidden_rows = hidden_row_numbers(book, sheet) if not report.include_hidden_rows else set()
+                            total = matched = 0
+                            first, last = sorted((result.chinese_column, result.korean_column))
+                            for number, row in enumerate(sheet.iter_rows(min_row=result.header_row + 1,
+                                                                        min_col=first, max_col=last), result.header_row + 1):
+                                chinese = row[result.chinese_column - first]
+                                korean = row[result.korean_column - first]
+                                if number in hidden_rows:
+                                    continue
+                                if chinese.data_type == "f" or korean.data_type == "f":
+                                    raise ValueError(f"第 {number} 行中韩文本含公式，请先转成文本值")
+                                key = match_key(chinese.value)
+                                if not key:
+                                    continue
+                                total += 1
+                                if connection.execute("SELECT 1 FROM targets WHERE text=?", (key,)).fetchone():
+                                    matched += 1
+                                    connection.execute("INSERT INTO hits VALUES (?,?,?,?,?,?)",
+                                                       (key, chinese.value, None if korean.value is None else str(korean.value), str(path), sheet.title, number))
+                            connection.execute("RELEASE sheet")
+                            sheet_rows.append([path.name, str(path), result.sheet, total, matched, total - matched,
+                                               matched / total if total else None])
+                        except sqlite3.Error:
+                            raise
+                        except Exception as error:
+                            connection.execute("ROLLBACK TO sheet")
+                            connection.execute("RELEASE sheet")
+                            result.issue = f"正文读取失败：{type(error).__name__}: {error}"
+                            skipped.append([path.name, str(path), result.sheet, result.issue])
+                    connection.commit()
+                except sqlite3.Error:
+                    raise
+                except Exception as error:
+                    for result in results:
+                        result.issue = f"文件读取失败：{type(error).__name__}: {error}"
+                        skipped.append([path.name, str(path), result.sheet, result.issue])
+                finally:
+                    if book is not None:
+                        book.close()
+            if not sheet_rows:
+                raise ValueError("所有候选 Sheet 正文读取失败，未生成匹配结果")
+            connection.executescript("CREATE TABLE counts AS SELECT text, COUNT(*) AS n FROM hits GROUP BY text; CREATE UNIQUE INDEX count_text ON counts(text);")
+            outputs = []
+            for path in baselines:
+                if progress:
+                    progress(f"写入基准副本：{path.name}")
+                relative = path.relative_to(baseline_root)
+                destination = staging / "基准匹配结果" / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                matched_rows += write_baseline_copy(path, destination, connection, baseline_parts[path])
+                outputs.append(Path("基准匹配结果") / relative)
+            file_rows = []
+            for filename in sorted({r[1] for r in sheet_rows} | {r[1] for r in skipped}):
+                rows = [r for r in sheet_rows if r[1] == filename]
+                skip_count = sum(r[1] == filename for r in skipped)
+                total = sum(r[3] for r in rows)
+                matched = sum(r[4] for r in rows)
+                file_rows.append([Path(filename).name, filename, len(rows), skip_count, total, matched, total - matched,
+                                  matched / total if total else None, "部分跳过" if rows and skip_count else "已扫描" if rows else "全部跳过"])
+            write_statistics(staging / "源文件匹配统计.xlsx", file_rows, sheet_rows, skipped)
+            outputs.append(Path("源文件匹配统计.xlsx"))
+        finally:
+            connection.close()
+        (staging / "index.sqlite3").unlink()
+        destination = output_root / ("匹配结果_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + staging.name[-6:])
+        os.rename(staging, destination)
+    return MatchReport(destination, fresh, baseline_rows, matched_rows, sum(r[3] for r in sheet_rows),
+                       sum(r[4] for r in sheet_rows), len(skipped), [destination / p for p in outputs])

@@ -327,6 +327,105 @@ class TranslationMatches(unittest.TestCase):
         self.assertTrue(all(s.max_row<=3 for s in book))
         book.close()
 
+    def test_context_recommends_per_baseline_and_keeps_full_evidence(self):
+        a = ["甲前一", "甲前二", "甲前三", "共同句", "甲后一", "甲后二", "甲后三"]
+        b = ["乙前一", "乙前二", "乙前三", "共同句", "乙后一", "乙后二", "乙后三"]
+        self.write_source([[t, "韩甲" if t == "共同句" else "译文"] for t in a], name="A.xlsx")
+        self.write_source([[t, "韩乙" if t == "共同句" else "译文"] for t in b], name="B.xlsx")
+        # One-sided candidate must lose to the candidate matching both sides.
+        self.write_source([[t, "干扰译文" if t == "共同句" else "译文"] for t in a[:4] + b[4:]], name="C.xlsx")
+        # Empty Korean never wins, even with the best context.
+        self.write_source([[t, None if t == "共同句" else "译文"] for t in a], name="D.xlsx")
+        self.write_baseline(a, name="A.xlsx")
+        (self.baseline / "子目录").mkdir()
+        self.write_baseline(b, name="子目录/B.xlsx")
+        result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
+        self.assertEqual((result.baseline_files, result.baseline_rows, result.matched_rows, result.recommended_rows), (2, 14, 14, 14))
+        for name, expected in (("A.xlsx", "韩甲"), ("子目录/B.xlsx", "韩乙")):
+            book = load_workbook(result.destination / "基准匹配结果" / name)
+            self.assertEqual(book.active["AD5"].value, expected)
+            self.assertEqual(book.active["AG5"].value, "上下文推荐")
+            self.assertIn("前3/3句一致，后3/3句一致", book.active["AF5"].value)
+            self.assertEqual(book.active["AC5"].value, "是")
+            book.close()
+        book = load_workbook(result.destination / "匹配明细.xlsx")
+        evidence = [dict(zip(next(book["匹配明细"].values), row)) for row in list(book["匹配明细"].values)[1:] if row[8] == "共同句"]
+        selected = [r for r in evidence if r["推荐来源"] == "是"]
+        self.assertEqual(len(selected), 2)
+        self.assertEqual({r["韩语"] for r in selected}, {"韩甲", "韩乙"})
+        self.assertTrue(all(r["完整一致侧数"] == 2 and r["一致位置总数"] == 6 for r in selected))
+        self.assertIn("前1句 [行4] 甲前三", selected[0]["基准前3句"])
+        book.close()
+        book = load_workbook(result.destination / "基准文件匹配统计.xlsx")
+        for row in list(book["文件统计"].values)[1:]:
+            self.assertEqual(row[2:11], (7, 7, 7, 7, 0, 0, 1, 1, 0))
+        self.assertEqual(list(book["总体统计"].values)[1][2:11], (14, 14, 14, 14, 0, 0, 2, 2, 0))
+        self.assertEqual(book["文件统计"]["L2"].number_format, "0.00%")
+        book.close()
+
+    def test_context_ties_boundaries_single_side_and_hidden_rows(self):
+        texts = ["前1", "前2", "前3", "争议", "后1", "后2", "后3"]
+        self.write_source([[t, "韩甲" if t == "争议" else "同译"] for t in texts], name="A.xlsx")
+        self.write_source([[t, "韩乙" if t == "争议" else "同译"] for t in texts], name="B.xlsx")
+        self.write_baseline(texts)
+        result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
+        book = load_workbook(result.destination / "基准匹配结果/story.xlsx")
+        self.assertIsNone(book.active["AD5"].value)
+        self.assertEqual(book.active["AG5"].value, "待确认")
+        self.assertIn("最高上下文得分", book.active["AF5"].value)
+        book.close()
+        # At a boundary, even two identical neighbours are insufficient for a conflict.
+        self.write_baseline(["争议", "后1", "后2"])
+        result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
+        book = load_workbook(result.destination / "基准匹配结果/story.xlsx")
+        self.assertEqual(book.active["AG2"].value, "待确认")
+        self.assertIn("完整前3句或完整后3句", book.active["AF2"].value)
+        book.close()
+        # Skip a hidden distractor; the next three nonempty records then match.
+        path = self.write_source([["争议", "韩甲"], ["隐藏干扰", "不可参与"], ["后1", "同译"],
+                                  [None, "空中文"], ["后2", "同译"], ["后3", "同译"]], name="A.xlsx")
+        book = load_workbook(path)
+        book.active.row_dimensions[3].hidden = True
+        book.save(path)
+        book.close()
+        self.write_source([["争议", "韩乙"], ["不同1", "同译"], ["不同2", "同译"], ["不同3", "同译"]], name="B.xlsx")
+        self.write_baseline(["争议", "后1", "后2", "后3"])
+        result = match_folder(scan_folder(self.source, 1, include_hidden_rows=False), self.baseline, self.output)
+        book = load_workbook(result.destination / "基准匹配结果/story.xlsx")
+        self.assertEqual(book.active["AD2"].value, "韩甲")
+        self.assertIn("前0/3句一致，后3/3句一致", book.active["AF2"].value)
+        book.close()
+
+    def test_many_baselines_summary_empty_missing_and_source_deduplication(self):
+        self.write_source([["唯一", " 번역 "], ["唯一", "번역"], ["缺译", None]])
+        for i in range(100):
+            self.write_baseline(["唯一", "缺译", "无匹配"], name=f"{i:03}.xlsx")
+        empty = self.write_baseline([], name="空.xlsx")
+        result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
+        self.assertEqual((result.baseline_files, result.baseline_rows, result.matched_rows, result.recommended_rows,
+                          result.source_rows, result.source_matched, result.match_pairs), (101, 300, 200, 100, 3, 3, 300))
+        book = load_workbook(result.destination / "基准文件匹配统计.xlsx")
+        rows = {r[0]: r for r in list(book["文件统计"].values)[1:]}
+        self.assertEqual(rows["000.xlsx"][2:11], (3, 2, 1, 1, 1, 1, 0, 0, 0))
+        self.assertEqual(rows["空.xlsx"][2:11], (0,) * 9)
+        self.assertEqual(rows["空.xlsx"][11:], (None, None, None))
+        total = list(book["总体统计"].values)[1]
+        self.assertEqual(total[:11], (101, 101, 300, 200, 100, 100, 100, 100, 0, 0, 0))
+        self.assertAlmostEqual(total[11], 2/3)
+        book.close()
+        book = load_workbook(result.destination / "基准匹配结果/000.xlsx")
+        self.assertEqual(book.active["AG2"].value, "唯一译文")
+        self.assertEqual(book.active["AG3"].value, "全部缺译")
+        self.assertEqual(book.active["AG4"].value, "未匹配")
+        book.close()
+        # New recommendation columns must also be protected from overwrite.
+        book = load_workbook(empty)
+        book.active["AG2"] = "已有判断"
+        book.save(empty)
+        book.close()
+        with self.assertRaisesRegex(ValueError, "R～AG 列已有内容"):
+            match_folder(scan_folder(self.source, 1), self.baseline, self.output)
+
 
 
 if __name__ == "__main__":

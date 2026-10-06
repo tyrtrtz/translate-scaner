@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 REPOSITORY = "tyrtrtz/translate-scaner"
 ASSET_NAME = "HeaderChecker.exe"
 
@@ -25,8 +25,8 @@ def version_numbers(value):
 
 
 def check_for_update(current=VERSION):
-    request = Request(f"https://api.github.com/repos/{REPOSITORY}/releases/latest",
-                      headers={"Accept": "application/vnd.github+json", "User-Agent": f"HeaderChecker/{VERSION}"})
+    request = Request(f"https://github.com/{REPOSITORY}/releases/latest/download/update.json",
+                      headers={"User-Agent": f"HeaderChecker/{VERSION}"})
     try:
         with urlopen(request, timeout=10) as response:
             release = json.loads(response.read(1024 * 1024))
@@ -34,20 +34,15 @@ def check_for_update(current=VERSION):
         if error.code == 404:
             return None  # There may not be a published release yet.
         raise
-    if release.get("draft") or release.get("prerelease"):
+    version = release.get("version")
+    if version_numbers(version) <= version_numbers(current):
         return None
-    tag = release.get("tag_name")
-    if version_numbers(tag) <= version_numbers(current):
-        return None
-    asset = next((a for a in release.get("assets", []) if a.get("name") == ASSET_NAME), None)
-    if asset is None:
-        raise ValueError("新版本尚未上传 Windows 程序，请稍后重试")
-    url = f"https://github.com/{REPOSITORY}/releases/download/{tag}/{ASSET_NAME}"
-    if (asset.get("browser_download_url") != url or asset.get("state") != "uploaded"
-            or type(asset.get("size")) is not int or not 0 < asset["size"] <= 200 * 1024 * 1024
-            or not re.fullmatch(r"sha256:[0-9a-f]{64}", asset.get("digest") or "")):
+    url = f"https://github.com/{REPOSITORY}/releases/download/v{version}/{ASSET_NAME}"
+    if (release.get("url") != url or type(release.get("size")) is not int
+            or not 0 < release["size"] <= 200 * 1024 * 1024
+            or not re.fullmatch(r"[0-9a-f]{64}", release.get("sha256") or "")):
         raise ValueError("发布文件的地址、大小或校验信息无效")
-    return dict(version=tag.removeprefix("v"), url=url, size=asset["size"], sha256=asset["digest"][7:])
+    return dict(version=version, url=url, size=release["size"], sha256=release["sha256"])
 
 
 def download_update(release, target, progress=lambda percent: None):

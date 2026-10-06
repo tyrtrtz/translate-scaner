@@ -82,4 +82,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$env:GITHUB_REF_NAME" "dist/HeaderChecker.exe" --verify-tag --title "中韩译文工作台 $env:GITHUB_REF_NAME" --notes-file docs/发布说明.md
+        run: |
+          python -c "import json, hashlib; from pathlib import Path; from updater import VERSION, REPOSITORY, ASSET_NAME; p = Path('dist') / ASSET_NAME; data = dict(version=VERSION, url=f'https://github.com/{REPOSITORY}/releases/download/v{VERSION}/{ASSET_NAME}', size=p.stat().st_size, sha256=hashlib.sha256(p.read_bytes()).hexdigest()); Path('dist/update.json').write_text(json.dumps(data), encoding='utf-8')"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not generate update manifest.' }
+          gh release create "$env:GITHUB_REF_NAME" "dist/HeaderChecker.exe" "dist/update.json" --verify-tag --title "中韩译文工作台 $env:GITHUB_REF_NAME" --notes-file docs/发布说明.md

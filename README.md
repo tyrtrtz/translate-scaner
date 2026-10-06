@@ -122,18 +122,18 @@ Windows 开发环境将前两条替换为 `py -3 -m venv .venv` 和 `.venv\Scrip
 
 从 v1.1.0 起，Windows exe 启动时后台查询 GitHub 最新正式 Release；右上角显示当前版本，也可点击“检查更新”。发现新版本后由用户确认，自动下载、校验文件大小及 SHA256，关闭旧程序、替换 exe 并重启。扫描、检索或下载期间禁止安装更新；后台检查不影响正在运行的任务，发现更新后可以等任务结束再点击更新。
 
-网络不通或 GitHub 限流时扫描仍可使用，稍后重试即可。下载或校验失败不修改旧程序；替换与启动失败时尝试恢复备份。更新目录需有当前用户写权限；本地设置、忽略记录、客户源文件和检索结果均保留。macOS 开发版可检查版本，自动替换仅支持 Windows 打包 exe。以前没有更新功能的 exe 需要手动更换一次。
+从 v1.1.1 起通过最新 Release 的 `update.json` 查询版本、固定版本下载地址、文件大小与 SHA256，避开 GitHub API 匿名限流。网络不通时扫描仍可使用，稍后重试即可。下载或校验失败不修改旧程序；替换与启动失败时尝试恢复备份。更新目录需有当前用户写权限；本地设置、忽略记录、客户源文件和检索结果均保留。macOS 开发版可检查版本，自动替换仅支持 Windows 打包 exe。以前没有更新功能的 exe 需要手动更换一次。
 
 客户无需 GitHub 账号，正式下载入口为 [最新发布版本](https://github.com/tyrtrtz/translate-scaner/releases/latest)。本程序仅请求版本信息和下载 exe，不上传客户文件。
 
-发布新版本时，修改 `updater.py` 中的 `VERSION`（例如 `1.1.1`），更新 `docs/发布说明.md`，提交推送后创建同名标签：
+发布新版本时，修改 `updater.py` 中的 `VERSION`（例如 `1.1.2`），更新 `docs/发布说明.md`，提交推送后创建同名标签：
 
 ```sh
-git tag v1.1.1
-git push origin v1.1.1
+git tag v1.1.2
+git push origin v1.1.2
 ```
 
-标签触发 Windows 测试、打包和启动检查，通过后自动发布 GitHub Release；标签版本必须与程序版本完全一致。普通 main 推送继续生成测试构建产物，不作为正式客户端更新。版本接口及文件校验信息使用 [GitHub 官方 Release API](https://docs.github.com/en/rest/releases/releases#get-the-latest-release)。
+标签触发 Windows 测试、打包和启动检查，通过后自动生成更新清单并发布 GitHub Release；标签版本必须与程序版本完全一致。普通 main 推送继续生成测试构建产物，不作为正式客户端更新。客户端使用 [GitHub 官方的最新发布文件直链](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases) 下载更新清单。
 
 ### GitHub Actions
 

@@ -25,9 +25,8 @@ class Updates(unittest.TestCase):
         struct.pack_into('<I', executable, 60, 64)
         executable[64:70] = b'PE\x00\x00\x64\x86'
         url = f'https://github.com/{REPOSITORY}/releases/download/v1.2.0/{ASSET_NAME}'
-        asset = dict(name=ASSET_NAME, browser_download_url=url, state='uploaded', size=len(executable),
-                     digest='sha256:' + hashlib.sha256(executable).hexdigest())
-        release = dict(tag_name='v1.2.0', draft=False, prerelease=False, assets=[asset])
+        release = dict(version='1.2.0', url=url, size=len(executable),
+                       sha256=hashlib.sha256(executable).hexdigest())
 
         def check(current='1.1.0'):
             with patch('updater.urlopen', return_value=io.BytesIO(json.dumps(release).encode())):
@@ -37,15 +36,12 @@ class Updates(unittest.TestCase):
         self.assertEqual(result['version'], '1.2.0')
         self.assertIsNone(check('1.2.0'))
         self.assertIsNone(check('1.10.0'))
-        release['prerelease'] = True
-        self.assertIsNone(check())
-        release['prerelease'] = False
-        for key, invalid in (('browser_download_url', 'https://example.com/app.exe'), ('digest', None), ('size', -1)):
-            original = asset[key]
-            asset[key] = invalid
+        for key, invalid in (('url', 'https://example.com/app.exe'), ('sha256', None), ('size', -1), ('version', 'invalid')):
+            original = release[key]
+            release[key] = invalid
             with self.assertRaises(ValueError):
                 check()
-            asset[key] = original
+            release[key] = original
         with patch('updater.urlopen', side_effect=HTTPError(url, 404, 'Not found', {}, None)):
             self.assertIsNone(check_for_update())
         with patch('updater.urlopen', side_effect=HTTPError(url, 403, 'Rate limited', {}, None)):

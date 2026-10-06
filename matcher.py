@@ -6,6 +6,7 @@ import tempfile
 import shutil
 import re
 import json
+from io import TextIOWrapper
 from zipfile import ZipFile
 from xml.sax.expatreader import create_parser
 from xml.sax.handler import feature_external_ges
@@ -82,6 +83,8 @@ class BaselineWriter(XMLGenerator):
     """Stream original worksheet XML unchanged in meaning, adding R:AG cells."""
 
     def __init__(self, stream, connection, path, sheet):
+        # Avoid the platform's automatic LF -> CRLF conversion in worksheet XML.
+        stream = TextIOWrapper(stream, encoding="utf-8", newline="\n", write_through=True)
         super().__init__(stream, encoding="utf-8", short_empty_elements=True)
         self.connection, self.path, self.sheet = connection, str(path), sheet
         self.row = None

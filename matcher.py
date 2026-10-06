@@ -9,7 +9,7 @@ import json
 from zipfile import ZipFile
 from xml.sax.expatreader import create_parser
 from xml.sax.handler import feature_external_ges
-from xml.sax.saxutils import XMLGenerator
+from xml.sax.saxutils import XMLGenerator, escape
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +25,24 @@ from scanner import SUPPORTED, hidden_row_numbers, scan_folder
 
 def match_key(value):
     return value.strip() if isinstance(value, str) else ""
+
+
+def boundary_newlines(value):
+    """Detect CR/LF in the whitespace before and after the baseline text."""
+    return tuple(any(c in edge for c in "\r\n") for edge in (
+        re.match(r"^\s*", value).group(), re.search(r"\s*$", value).group()))
+
+
+def align_boundary_newlines(value, keep_start, keep_end):
+    """Remove unwanted boundary CR/LF only; retain spaces and internal newlines."""
+    if not isinstance(value, str):
+        return value
+    without_newlines = lambda match: match.group().replace("\r", "").replace("\n", "")
+    if not keep_start:
+        value = re.sub(r"^\s+", without_newlines, value, count=1)
+    if not keep_end:
+        value = re.sub(r"\s+$", without_newlines, value, count=1)
+    return value
 
 
 def text_cell(sheet, row, column, value):
@@ -106,6 +124,15 @@ class BaselineWriter(XMLGenerator):
         if self.protected_cell and self.protected_value and content:
             self.existing_content()
         if not self.omit_dimension and not self.protected_cell:
+            self.xml_characters(content)
+
+    def xml_characters(self, content):
+        # XML parsers normalize literal CR/CRLF; character references preserve
+        # retained source newlines and the original baseline cell values.
+        if "\r" in content:
+            self._finish_pending_start_element()
+            self._write(escape(content, {"\r": "&#13;"}))
+        else:
             super().characters(content)
 
     def existing_content(self):
@@ -126,7 +153,7 @@ class BaselineWriter(XMLGenerator):
         if isinstance(value, str):
             super().startElement(self.prefix + "is", {})
             super().startElement(self.prefix + "t", {"xml:space": "preserve"})
-            super().characters(value)
+            self.xml_characters(value)
             super().endElement(self.prefix + "t")
             super().endElement(self.prefix + "is")
         else:
@@ -162,15 +189,19 @@ class BaselineWriter(XMLGenerator):
                 for column, title in enumerate(("推荐韩语", "推荐来源", "推荐依据", "推荐状态"), 30):
                     self.output_cell(column, title)
             else:
-                key = self.connection.execute("SELECT text FROM baseline_rows WHERE path=? AND sheet=? AND row=?",
+                record = self.connection.execute("SELECT text,leading_newline,trailing_newline FROM baseline_rows WHERE path=? AND sheet=? AND row=?",
                                               (self.path, self.sheet, self.row)).fetchone()
-                if key:
+                if record:
+                    key = (record[0],)
+                    keep_start, keep_end = record[1:]
                     summary = self.connection.execute("SELECT n,missing FROM counts WHERE text=?", key).fetchone()
                     count, missing = summary if summary else (0, 0)
                     self.matched_rows += bool(count)
                     if 0 < count <= 3:
                         hits = self.connection.execute("SELECT chinese,korean,path,sheet,row FROM hits WHERE text=? ORDER BY rowid LIMIT 3", key)
                         for index, (chinese, korean, filename, title, number) in enumerate(hits):
+                            chinese = align_boundary_newlines(chinese, keep_start, keep_end)
+                            korean = align_boundary_newlines(korean, keep_start, keep_end)
                             for offset, value in enumerate((chinese, korean, f"{filename}；Sheet：{title}；行号：{number}")):
                                 self.output_cell(18 + index * 3 + offset, value)
                     self.output_cell(27, count)
@@ -183,7 +214,7 @@ class BaselineWriter(XMLGenerator):
                         WHERE r.path=? AND r.sheet=? AND r.row=?
                     """, (self.path, self.sheet, self.row)).fetchone()
                     korean, filename, title, number, basis, status = recommendation
-                    self.output_cell(30, korean)
+                    self.output_cell(30, align_boundary_newlines(korean, keep_start, keep_end))
                     if filename is not None:
                         self.output_cell(31, f"{filename}；Sheet：{title}；行号：{number}")
                     self.output_cell(32, basis)
@@ -514,7 +545,8 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
         try:
             connection.executescript("""
                 CREATE TABLE targets (text TEXT PRIMARY KEY);
-                CREATE TABLE baseline_rows (path TEXT, sheet TEXT, row INTEGER, text TEXT, seq INTEGER, PRIMARY KEY (path, sheet, row));
+                CREATE TABLE baseline_rows (path TEXT, sheet TEXT, row INTEGER, text TEXT, seq INTEGER,
+                    leading_newline INTEGER,trailing_newline INTEGER,PRIMARY KEY (path, sheet, row));
                 CREATE INDEX baseline_text ON baseline_rows(text);
                 CREATE UNIQUE INDEX baseline_sequence ON baseline_rows(path,sheet,seq);
                 CREATE TABLE source_rows (text TEXT, chinese TEXT, korean TEXT, path TEXT, sheet TEXT, row INTEGER, korean_key TEXT, seq INTEGER);
@@ -541,7 +573,8 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                                 baseline_rows += 1
                                 sequence += 1
                                 connection.execute("INSERT OR IGNORE INTO targets VALUES (?)", (key,))
-                                connection.execute("INSERT INTO baseline_rows VALUES (?,?,?,?,?)", (str(path), sheet.title, cell.row, key, sequence))
+                                connection.execute("INSERT INTO baseline_rows VALUES (?,?,?,?,?,?,?)",
+                                                   (str(path), sheet.title, cell.row, key, sequence, *boundary_newlines(cell.value)))
                 finally:
                     book.close()
             if not baseline_rows:

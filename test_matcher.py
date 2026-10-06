@@ -10,7 +10,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
 
 from ignored_sheets import sheet_key
-from matcher import match_folder, write_detail_sheet
+from matcher import align_boundary_newlines, match_folder, write_detail_sheet
 from scanner import scan_folder
 
 
@@ -51,6 +51,53 @@ class TranslationMatches(unittest.TestCase):
         book.save(path)
         book.close()
         return path
+
+    def test_output_boundary_newlines_follow_each_baseline_row(self):
+        chinese = " \r\n\n\t甲\n乙 \t\r\n\n "
+        korean = " \n\r\n\t번역\n둘 \t\n\r\n "
+        source = self.write_source([[chinese, korean], ["无译文", None],
+                                    ["\n三组\n", "\n단일\n"], ["\r三组\r", "\r단일\r"], ["\r\n三组\r\n", "\r\n단일\r\n"]])
+        baselines = ["甲\n乙", "\r\n甲\n乙", "甲\n乙\r\n", " \r\n甲\n乙\n ", "无译文", "三组"]
+        baseline = self.write_baseline(baselines)
+        # A fourth source occurrence suppresses R:Z, but AD must still be cleaned.
+        self.write_source([["\r\n多条\r\n", "\r\n여러\r\n"]] * 4, name="多条.xlsx")
+        other = self.write_baseline(["多条", "\r\n多条\r\n"], name="另一个.xlsx")
+        original = {p: hashlib.sha256(p.read_bytes()).digest() for p in (source, baseline, other)}
+        result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
+        self.assertEqual((result.baseline_rows, result.matched_rows, result.recommended_rows, result.source_rows,
+                          result.source_matched, result.match_pairs, result.conflict_texts), (8, 8, 7, 9, 9, 16, 0))
+        book = load_workbook(result.destination / "基准匹配结果/story.xlsx")
+        clean_chinese, clean_korean = " \t甲\n乙 \t ", " \t번역\n둘 \t "
+        expected = [(clean_chinese, clean_korean),
+                    (" \r\n\n\t甲\n乙 \t ", " \n\r\n\t번역\n둘 \t "),
+                    (" \t甲\n乙 \t\r\n\n ", " \t번역\n둘 \t\n\r\n "),
+                    (chinese, korean)]
+        for row, (cn, ko) in enumerate(expected, 2):
+            self.assertEqual(book.active.cell(row, 7).value, baselines[row - 2])
+            self.assertEqual(book.active.cell(row, 18).value, cn)
+            self.assertEqual(book.active.cell(row, 19).value, ko)
+            self.assertEqual(book.active.cell(row, 30).value, ko)
+            self.assertEqual(book.active.cell(row, 33).value, "唯一译文")
+        self.assertIsNone(book.active["S6"].value)
+        self.assertIsNone(book.active["AD6"].value)
+        self.assertEqual([book.active.cell(7,c).value for c in (18,21,24)], ["三组"] * 3)
+        self.assertEqual([book.active.cell(7,c).value for c in (19,22,25,30)], ["단일"] * 4)
+        book.close()
+        book = load_workbook(result.destination / "基准匹配结果/另一个.xlsx")
+        self.assertIsNone(book.active["R2"].value)
+        self.assertEqual(book.active["AD2"].value, "여러")
+        self.assertEqual(book.active["AA2"].value, 4)
+        self.assertEqual(book.active["G3"].value, "\r\n多条\r\n")
+        self.assertEqual(book.active["AD3"].value, "\r\n여러\r\n")
+        book.close()
+        # Evidence remains raw, and none of the original workbooks is saved.
+        book = load_workbook(result.destination / "匹配明细.xlsx")
+        self.assertTrue(all(r[8:10] == (chinese, korean) for r in list(book["匹配明细"].values)[1:] if r[4] == source.name and r[7] == 2))
+        book.close()
+        self.assertEqual(original, {p: hashlib.sha256(p.read_bytes()).digest() for p in original})
+        self.assertEqual(align_boundary_newlines("\n=文字\n", False, False), "=文字")
+        self.assertEqual(align_boundary_newlines(" \r\n\t ", False, False), " \t ")
+        self.assertEqual(align_boundary_newlines("原文无换行", True, True), "原文无换行")
 
     def test_counts_details_stats_unicode_and_originals_unchanged(self):
         rows = [["一条", "번역1"], ["  两条  ", "번역2"], ["两条", "번역3"],

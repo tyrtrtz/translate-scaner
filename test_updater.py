@@ -86,19 +86,7 @@ class Updates(unittest.TestCase):
             shutil.copy2(Path(os.environ['SystemRoot']) / 'System32' / 'where.exe', download)
             expected = hashlib.sha256(download.read_bytes()).digest()
             old = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(1)'])
-            self.addCleanup(lambda: old.poll() is None and old.kill())
-            helper = start_installation(download, target, old.pid)
-            try:
-                self.assertEqual(helper.wait(timeout=30), 0)
-            finally:
-                if helper.poll() is None:
-                    helper.kill()
-            self.assertIsNotNone(old.poll())
-            self.assertEqual(hashlib.sha256(target.read_bytes()).digest(), expected)
-            self.assertFalse(staging.exists())
-            # A replacement failure after backing up must restore the old exe.
-            # Suppress only the modal failure dialog in the unattended CI run.
-            staging.mkdir()
+            self.addCleanup(lambda: old.wait(timeout=5))
             real_popen = subprocess.Popen
 
             def without_dialog(command, **kwargs):
@@ -108,6 +96,21 @@ class Updates(unittest.TestCase):
                 script.write_text(source, encoding='utf-8-sig')
                 return real_popen(command, **kwargs)
 
+            with patch('updater.subprocess.Popen', side_effect=without_dialog):
+                helper = start_installation(download, target, old.pid)
+            try:
+                code = helper.wait(timeout=40)
+                error = staging / 'update-error.txt'
+                self.assertEqual(code, 0, error.read_text(encoding='utf-8-sig') if error.exists() else '')
+            finally:
+                if helper.poll() is None:
+                    helper.kill()
+            self.assertIsNotNone(old.poll())
+            self.assertEqual(hashlib.sha256(target.read_bytes()).digest(), expected)
+            self.assertFalse(staging.exists())
+            # A replacement failure after backing up must restore the old exe.
+            # Suppress only the modal failure dialog in the unattended CI run.
+            staging.mkdir()
             with patch('updater.subprocess.Popen', side_effect=without_dialog):
                 helper = start_installation(download, target, old.pid)
             try:

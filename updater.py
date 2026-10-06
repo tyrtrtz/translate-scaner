@@ -105,10 +105,10 @@ try {{
     }}
     # PyInstaller's parent launcher can retain the exe briefly after Tk closes.
     for ($attempt = 0; $attempt -lt 60; $attempt++) {{
-        try {{ Move-Item -LiteralPath $targetPath -Destination $backupPath; break }}
+        try {{ [System.IO.File]::Move($targetPath, $backupPath); break }}
         catch {{ if ($attempt -eq 59) {{ throw }}; Start-Sleep -Milliseconds 500 }}
     }}
-    Move-Item -LiteralPath $downloadPath -Destination $targetPath
+    [System.IO.File]::Move($downloadPath, $targetPath)
     Start-Process -FilePath $targetPath -WorkingDirectory (Split-Path -LiteralPath $targetPath)
     Remove-Item -LiteralPath $stagingPath -Recurse -Force -ErrorAction SilentlyContinue
 }} catch {{
@@ -116,7 +116,7 @@ try {{
     if (Test-Path -LiteralPath $backupPath) {{
         try {{
             if (Test-Path -LiteralPath $targetPath) {{ Remove-Item -LiteralPath $targetPath -Force }}
-            Move-Item -LiteralPath $backupPath -Destination $targetPath
+            [System.IO.File]::Move($backupPath, $targetPath)
             Start-Process -FilePath $targetPath -WorkingDirectory (Split-Path -LiteralPath $targetPath)
         }} catch {{ $failure += "`n恢复文件位置：$backupPath`n" + $_.Exception.Message }}
     }}

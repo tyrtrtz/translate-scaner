@@ -14,6 +14,7 @@ from scanner import export_exceptions, scan_folder
 from ignored_sheets import default_ignore_file, load_ignored, save_ignored, sheet_key
 from matcher import match_folder
 from settings import default_settings, load_settings, save_settings
+from updater import VERSION, can_install_updates, check_for_update, download_update, start_installation
 
 
 COLORS = dict(background="#f5f5f7", surface="#ffffff", ink="#1d1d1f",
@@ -295,6 +296,9 @@ class Application:
         self.running = False
         self.match_report = None
         self.events = queue.Queue()
+        self.update_checking = False
+        self.update_downloading = False
+        self.available_update = None
         self.ignore_file = Path(ignore_file) if ignore_file is not None else default_ignore_file()
         self.settings_file = Path(settings_file) if settings_file is not None else self.ignore_file.with_name("settings.json")
         self.settings_error = ""
@@ -324,7 +328,12 @@ class Application:
         wordmark.pack(side="left")
         ttk.Label(wordmark, text="中韩译文工作台", style="Title.TLabel").pack(anchor="w")
         ttk.Label(wordmark, text="TRANSLATION DESK  /  表头检查 · 译文检索", style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
-        ttk.Label(header, text="源文件只读  /  结果另存副本", style="Badge.TLabel").pack(side="right")
+        update_controls = ttk.Frame(header)
+        update_controls.pack(side="right")
+        self.update_message = tk.StringVar(value=f"v{VERSION} · 源文件只读")
+        ttk.Label(update_controls, textvariable=self.update_message, style="Muted.TLabel").pack(anchor="e")
+        self.update_button = ttk.Button(update_controls, text="检查更新", command=self.check_updates)
+        self.update_button.pack(anchor="e", pady=(4, 0))
 
         body = ttk.Frame(frame)
         body.pack(fill="both", expand=True)
@@ -531,6 +540,8 @@ class Application:
         if self.settings_error:
             root.after(0, lambda: messagebox.showerror("本地设置读取失败", self.settings_error + "\n已使用默认设置；保存已停用，原文件不会被覆盖。"))
         root.after(100, self.poll)
+        if can_install_updates():
+            root.after(1500, lambda: self.check_updates(manual=False))
 
     def layout_table(self, frame, table):
         vertical = AutoScrollbar(frame, orient="vertical", command=table.yview)
@@ -619,6 +630,51 @@ class Application:
         self.match_open_button.configure(state="normal" if not running and self.match_report else "disabled")
         self.match_details_button.configure(state="normal" if not running and self.match_report else "disabled")
         self.save_settings_button.configure(state="normal" if not running and not self.settings_error else "disabled")
+        self.update_button.configure(state="disabled" if running or self.update_checking else "normal")
+
+    def check_updates(self, manual=True):
+        if (self.running and manual) or self.update_checking or self.update_downloading:
+            return
+        if self.available_update is not None:
+            self.offer_update()
+            return
+        self.update_checking = True
+        self.update_button.configure(text="检查中…", state="disabled")
+
+        def work():
+            try:
+                self.events.put(("update_checked", (manual, check_for_update())))
+            except Exception as error:
+                self.events.put(("update_check_error", (manual, str(error))))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def offer_update(self):
+        if self.running or self.available_update is None:
+            return
+        release = self.available_update
+        if not can_install_updates():
+            messagebox.showinfo("发现新版本", f"最新版本为 v{release['version']}。自动替换与重启支持 Windows 打包 exe；开发时请更新源码。")
+            return
+        if not messagebox.askyesno("发现新版本", f"当前 v{VERSION}，最新 v{release['version']}。\n\n是否下载并更新？下载完成后程序会自动重启。\n本地设置、忽略列表和 Excel 文件保留。"):
+            return
+        if not self.settings_error and not self.store_settings():
+            return
+        self.update_downloading = True
+        self.set_running(True)
+        self.update_button.configure(text="正在更新…")
+        self.progress.configure(mode="determinate", maximum=100, value=0)
+        self.status.set("正在下载更新，完成后自动重启……")
+
+        def work():
+            try:
+                download = download_update(release, sys.executable,
+                                           progress=lambda percent: self.events.put(("update_progress", percent)))
+                self.events.put(("update_downloaded", download))
+            except Exception as error:
+                self.events.put(("update_download_error", str(error)))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def store_settings(self, notify=False):
         if self.settings_error:
@@ -776,6 +832,42 @@ class Application:
                         self.status.set("检索未完成。")
                         messagebox.showerror("检索失败", value)
                     self.set_running(False)
+                elif kind == "update_checked":
+                    manual, self.available_update = value
+                    self.update_checking = False
+                    self.update_button.configure(text=f"更新至 v{self.available_update['version']}" if self.available_update else "检查更新")
+                    self.update_message.set(f"v{VERSION} · 发现新版本" if self.available_update else f"v{VERSION} · 已是最新版")
+                    self.set_running(self.running)
+                    if self.available_update:
+                        self.offer_update()
+                    elif manual:
+                        messagebox.showinfo("检查更新", f"当前 v{VERSION}，暂无更新版本。")
+                elif kind == "update_check_error":
+                    manual, error = value
+                    self.update_checking = False
+                    self.update_button.configure(text="重试检查更新")
+                    self.update_message.set(f"v{VERSION} · 无法连接更新服务")
+                    self.set_running(self.running)
+                    if manual:
+                        messagebox.showerror("无法检查更新", f"{error}\n请检查网络后重试，扫描功能可继续使用。")
+                elif kind == "update_progress":
+                    self.progress.configure(value=value)
+                    self.status.set(f"正在下载更新：{value}%，完成后自动重启……")
+                elif kind == "update_downloaded":
+                    try:
+                        start_installation(value, sys.executable)
+                    except Exception as error:
+                        self.events.put(("update_download_error", str(error)))
+                    else:
+                        self.root.destroy()
+                        return
+                elif kind == "update_download_error":
+                    self.update_downloading = False
+                    self.set_running(False)
+                    self.update_button.configure(text="重试更新")
+                    self.progress.configure(value=0)
+                    self.status.set("更新未完成，原程序与数据保留，可重试。")
+                    messagebox.showerror("更新失败", value)
         except queue.Empty:
             pass
         self.root.after(100, self.poll)
@@ -907,7 +999,7 @@ class Application:
 
     def close(self):
         if self.running:
-            messagebox.showinfo("正在处理", "请等待检查或检索结束后关闭窗口。")
+            messagebox.showinfo("正在处理", "请等待更新完成后自动重启。" if self.update_downloading else "请等待检查或检索结束后关闭窗口。")
         else:
             self.store_settings()
             self.root.destroy()

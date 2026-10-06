@@ -41,6 +41,34 @@ class DesktopWorkflow(unittest.TestCase):
             app = Application(root, ignore_file=base / "ignored.json", settings_file=base / "settings.json")
             root.geometry("1060x760")
             root.update()
+            with patch("app.check_for_update", return_value=None), patch("app.messagebox.showinfo") as notices:
+                app.update_button.invoke()
+                self.wait_for_task(root, app)
+                self.assertIn("已是最新版", app.update_message.get())
+                notices.assert_called_once()
+            with patch("app.check_for_update", side_effect=OSError("offline")):
+                app.update_button.invoke()
+                self.wait_for_task(root, app)
+                self.assertIn("无法连接", app.update_message.get())
+                self.assertTrue(app.start_button.instate(["!disabled"]))
+                errors.assert_called_once()
+                errors.reset_mock()
+            with patch("app.check_for_update", return_value={"version": "1.2.0"}), \
+                    patch("app.can_install_updates", return_value=True), \
+                    patch("app.messagebox.askyesno", return_value=False) as confirm:
+                app.set_running(True)
+                app.check_updates(manual=False)
+                deadline = time.monotonic() + 10
+                while app.update_checking and time.monotonic() < deadline:
+                    root.update()
+                    time.sleep(0.01)
+                self.assertFalse(app.update_checking)
+                self.assertTrue(app.update_button.instate(["disabled"]))
+                confirm.assert_not_called()
+                app.set_running(False)
+                app.update_button.invoke()
+                confirm.assert_called_once()
+                app.available_update = None
             self.assertTrue(app.status_label.winfo_ismapped())
             self.assertLessEqual(app.status_label.winfo_rooty() + app.status_label.winfo_height(), root.winfo_rooty() + root.winfo_height())
             self.assertTrue(app.match_button.instate(["disabled"]))
@@ -122,11 +150,12 @@ class DesktopWorkflow(unittest.TestCase):
 
     def wait_for_task(self, root, app):
         deadline = time.monotonic() + 10
-        while app.running and time.monotonic() < deadline:
+        while (app.running or app.update_checking) and time.monotonic() < deadline:
             root.update()
             time.sleep(0.01)
         root.update()
         self.assertFalse(app.running, "Background task did not finish")
+        self.assertFalse(app.update_checking, "Update check did not finish")
 
 
 if __name__ == "__main__":

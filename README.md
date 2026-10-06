@@ -118,13 +118,30 @@ Windows 开发环境将前两条替换为 `py -3 -m venv .venv` 和 `.venv\Scrip
 
 ## Windows exe
 
+### 程序内更新
+
+从 v1.1.0 起，Windows exe 启动时后台查询 GitHub 最新正式 Release；右上角显示当前版本，也可点击“检查更新”。发现新版本后由用户确认，自动下载、校验文件大小及 SHA256，关闭旧程序、替换 exe 并重启。扫描、检索或下载期间禁止安装更新；后台检查不影响正在运行的任务，发现更新后可以等任务结束再点击更新。
+
+网络不通或 GitHub 限流时扫描仍可使用，稍后重试即可。下载或校验失败不修改旧程序；替换与启动失败时尝试恢复备份。更新目录需有当前用户写权限；本地设置、忽略记录、客户源文件和检索结果均保留。macOS 开发版可检查版本，自动替换仅支持 Windows 打包 exe。以前没有更新功能的 exe 需要手动更换一次。
+
+客户无需 GitHub 账号，正式下载入口为 [最新发布版本](https://github.com/tyrtrtz/translate-scaner/releases/latest)。本程序仅请求版本信息和下载 exe，不上传客户文件。
+
+发布新版本时，修改 `updater.py` 中的 `VERSION`（例如 `1.1.1`），更新 `docs/发布说明.md`，提交推送后创建同名标签：
+
+```sh
+git tag v1.1.1
+git push origin v1.1.1
+```
+
+标签触发 Windows 测试、打包和启动检查，通过后自动发布 GitHub Release；标签版本必须与程序版本完全一致。普通 main 推送继续生成测试构建产物，不作为正式客户端更新。版本接口及文件校验信息使用 [GitHub 官方 Release API](https://docs.github.com/en/rest/releases/releases#get-the-latest-release)。
+
 ### GitHub Actions
 
 上传程序源码和 `.github/workflows/build-windows.yml` 后，推送到 `main` 或 `master` 会自动触发 **Build Windows exe**，也可在 Actions 页面手动点击 **Run workflow**。
 
 CI 使用 Windows x64 和 Python 3.13，依次安装打包依赖、运行测试、生成单文件 exe、验证打包后的窗口可以启动，然后上传构建产物。
 
-构建成功后，在该次运行页面的 **Artifacts** 下载 **HeaderChecker-Windows-x64**，解压得到 `HeaderChecker.exe`。客户双击即可使用，无需安装 Python。构建产物保留 30 天；需要时可重新触发构建。
+普通分支构建成功后，在该次运行页面的 **Artifacts** 下载 **HeaderChecker-Windows-x64**，解压得到 `HeaderChecker.exe`。正式版本在 **Releases** 直接提供 exe，并供程序内更新下载。客户双击即可使用，无需安装 Python。Artifacts 构建产物保留 30 天；正式 Release 不受此限制。
 
 客户资料、Excel 文件、需求文档、导出清单、本地设置和忽略记录均已加入 `.gitignore`；构建只依赖源码，不需要这些文件。
 

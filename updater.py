@@ -97,6 +97,16 @@ $downloadPath = {quote(download)}
 $backupPath = {quote(download.parent / 'previous.exe')}
 $stagingPath = {quote(download.parent)}
 $oldProcessId = {process_id}
+function Start-UpdatedApp {{
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = $targetPath
+    $info.WorkingDirectory = [System.IO.Path]::GetDirectoryName($targetPath)
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    # A restarted onefile app needs its own extracted runtime, not the old one.
+    $info.EnvironmentVariables['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    [System.Diagnostics.Process]::Start($info) | Out-Null
+}}
 try {{
     $deadline = (Get-Date).AddSeconds(60)
     while (Get-Process -Id $oldProcessId -ErrorAction SilentlyContinue) {{
@@ -109,7 +119,7 @@ try {{
         catch {{ if ($attempt -eq 59) {{ throw }}; Start-Sleep -Milliseconds 500 }}
     }}
     [System.IO.File]::Move($downloadPath, $targetPath)
-    Start-Process -FilePath $targetPath -WorkingDirectory (Split-Path -LiteralPath $targetPath)
+    Start-UpdatedApp
     Remove-Item -LiteralPath $stagingPath -Recurse -Force -ErrorAction SilentlyContinue
 }} catch {{
     $failure = $_.Exception.Message
@@ -117,7 +127,7 @@ try {{
         try {{
             if (Test-Path -LiteralPath $targetPath) {{ Remove-Item -LiteralPath $targetPath -Force }}
             [System.IO.File]::Move($backupPath, $targetPath)
-            Start-Process -FilePath $targetPath -WorkingDirectory (Split-Path -LiteralPath $targetPath)
+            Start-UpdatedApp
         }} catch {{ $failure += "`n恢复文件位置：$backupPath`n" + $_.Exception.Message }}
     }}
     $failure | Set-Content -LiteralPath (Join-Path $stagingPath 'update-error.txt') -Encoding UTF8

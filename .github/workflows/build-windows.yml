@@ -51,9 +51,23 @@ jobs:
               if ($app.HasExited) { throw "Packaged app exited: $($app.ExitCode)" }
             }
             if (-not $ready) { throw 'Packaged application window did not appear.' }
+            $oldWindowIds = @($window | ForEach-Object { $_.Id })
+            $staging = Join-Path "$PWD/dist" "update-smoke"
+            New-Item -ItemType Directory -Path $staging | Out-Null
+            Copy-Item "$PWD/dist/HeaderChecker.exe" "$staging/HeaderChecker.exe"
+            python -c "import sys; from updater import start_installation; start_installation(sys.argv[1], sys.argv[2], int(sys.argv[3]))" "$staging/HeaderChecker.exe" "$PWD/dist/HeaderChecker.exe" $app.Id
+            if ($LASTEXITCODE -ne 0) { throw 'Could not start update helper.' }
+            $window | ForEach-Object { $_.CloseMainWindow() | Out-Null }
+            $restarted = $false
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              Start-Sleep -Seconds 1
+              $newWindow = Get-Process -Name HeaderChecker -ErrorAction SilentlyContinue |
+                Where-Object { $_.MainWindowTitle -eq '中韩表头检查' -and $_.Id -notin $oldWindowIds }
+              if ($newWindow -and -not (Test-Path $staging)) { $restarted = $true; break }
+            }
+            if (-not $restarted) { throw 'Packaged application did not restart after replacement.' }
           } finally {
-            $app.Refresh()
-            if (-not $app.HasExited) { taskkill /PID $app.Id /T /F | Out-Null }
+            Get-Process -Name HeaderChecker -ErrorAction SilentlyContinue | Stop-Process -Force
           }
 
       - name: Upload Windows exe

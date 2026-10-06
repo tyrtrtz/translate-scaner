@@ -53,15 +53,36 @@ class TranslationMatches(unittest.TestCase):
         return path
 
     def test_output_boundary_newlines_follow_each_baseline_row(self):
-        chinese = " \r\n\n\t甲\n乙 \t\r\n\n "
-        korean = " \n\r\n\t번역\n둘 \t\n\r\n "
+        def preserve_cell_text(path, cells):
+            # Without lxml, openpyxl's fixture writer emits literal CR. XML
+            # readers normalize it, so encode CR as Excel's character reference.
+            with ZipFile(path) as archive:
+                parts = [(item, archive.read(item)) for item in archive.infolist()]
+            with ZipFile(path, "w") as archive:
+                for item, data in parts:
+                    if item.filename == "xl/worksheets/sheet1.xml":
+                        root = ET.fromstring(data)
+                        for cell in root.findall(".//{*}c"):
+                            if cell.get("r") in cells:
+                                cell.find("{*}is/{*}t").text = cells[cell.get("r")]
+                        data = ET.tostring(root, encoding="utf-8").replace(b"\r", b"&#13;")
+                    archive.writestr(item, data)
+
+        chinese = " \n\n\t甲\n乙 \t\n\n "
+        korean = " \n\n\t번역\n둘 \t\n\n "
         source = self.write_source([[chinese, korean], ["无译文", None],
                                     ["\n三组\n", "\n단일\n"], ["\r三组\r", "\r단일\r"], ["\r\n三组\r\n", "\r\n단일\r\n"]])
         baselines = ["甲\n乙", "\r\n甲\n乙", "甲\n乙\r\n", " \r\n甲\n乙\n ", "无译文", "三组"]
         baseline = self.write_baseline(baselines)
+        preserve_cell_text(source, {"A5": "\r三组\r", "B5": "\r단일\r",
+                                    "A6": "\r\n三组\r\n", "B6": "\r\n단일\r\n"})
+        preserve_cell_text(baseline, {f"G{row}": text for row, text in enumerate(baselines, 2)})
         # A fourth source occurrence suppresses R:Z, but AD must still be cleaned.
-        self.write_source([["\r\n多条\r\n", "\r\n여러\r\n"]] * 4, name="多条.xlsx")
+        many = self.write_source([["\r\n多条\r\n", "\r\n여러\r\n"]] * 4, name="多条.xlsx")
+        preserve_cell_text(many, {f"{column}{row}": text for row in range(2, 6)
+                                 for column, text in (("A", "\r\n多条\r\n"), ("B", "\r\n여러\r\n"))})
         other = self.write_baseline(["多条", "\r\n多条\r\n"], name="另一个.xlsx")
+        preserve_cell_text(other, {"G3": "\r\n多条\r\n"})
         original = {p: hashlib.sha256(p.read_bytes()).digest() for p in (source, baseline, other)}
         result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
         self.assertEqual((result.baseline_rows, result.matched_rows, result.recommended_rows, result.source_rows,
@@ -69,8 +90,8 @@ class TranslationMatches(unittest.TestCase):
         book = load_workbook(result.destination / "基准匹配结果/story.xlsx")
         clean_chinese, clean_korean = " \t甲\n乙 \t ", " \t번역\n둘 \t "
         expected = [(clean_chinese, clean_korean),
-                    (" \r\n\n\t甲\n乙 \t ", " \n\r\n\t번역\n둘 \t "),
-                    (" \t甲\n乙 \t\r\n\n ", " \t번역\n둘 \t\n\r\n "),
+                    (" \n\n\t甲\n乙 \t ", " \n\n\t번역\n둘 \t "),
+                    (" \t甲\n乙 \t\n\n ", " \t번역\n둘 \t\n\n "),
                     (chinese, korean)]
         for row, (cn, ko) in enumerate(expected, 2):
             self.assertEqual(book.active.cell(row, 7).value, baselines[row - 2])

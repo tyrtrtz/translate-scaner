@@ -35,14 +35,18 @@ def boundary_newlines(value):
 
 
 def align_boundary_newlines(value, keep_start, keep_end):
-    """Remove unwanted boundary CR/LF only; retain spaces and internal newlines."""
+    """Align boundary newline presence; retain spaces and internal newlines."""
     if not isinstance(value, str):
         return value
     without_newlines = lambda match: match.group().replace("\r", "").replace("\n", "")
     if not keep_start:
         value = re.sub(r"^\s+", without_newlines, value, count=1)
+    elif value.strip() and not boundary_newlines(value)[0]:
+        value = "\n" + value
     if not keep_end:
         value = re.sub(r"\s+$", without_newlines, value, count=1)
+    elif value.strip() and not boundary_newlines(value)[1]:
+        value += "\n"
     return value
 
 

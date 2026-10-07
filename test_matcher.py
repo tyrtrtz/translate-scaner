@@ -118,7 +118,40 @@ class TranslationMatches(unittest.TestCase):
         self.assertEqual(original, {p: hashlib.sha256(p.read_bytes()).digest() for p in original})
         self.assertEqual(align_boundary_newlines("\n=文字\n", False, False), "=文字")
         self.assertEqual(align_boundary_newlines(" \r\n\t ", False, False), " \t ")
-        self.assertEqual(align_boundary_newlines("原文无换行", True, True), "原文无换行")
+        self.assertEqual(align_boundary_newlines("原文无换行", True, True), "\n原文无换行\n")
+        self.assertEqual(align_boundary_newlines(" \t正文\t ", True, False), "\n \t正文\t ")
+        self.assertEqual(align_boundary_newlines(" \r\n正文\n\n ", True, True), " \r\n正文\n\n ")
+        self.assertEqual(align_boundary_newlines("正文\n\n", True, False), "\n正文")
+        self.assertEqual(align_boundary_newlines("\n正文", False, True), "正文\n")
+        self.assertEqual(align_boundary_newlines(None, True, True), None)
+        self.assertEqual(align_boundary_newlines(" \t ", True, True), " \t ")
+
+    def test_missing_boundary_newlines_are_added_per_baseline(self):
+        self.write_source([["中文\n正文", "번역\n본문"]] * 3 + [["缺译", None], ["未推荐", "甲译文"], ["未推荐", "乙译文"]])
+        self.write_source([["多条", "여러"]] * 4, name="多条.xlsx")
+        baselines = ["中文\n正文", "\n中文\n正文", "中文\n正文\n", "\n\n中文\n正文\n\n", "\n缺译\n", "\n未命中\n", "\n未推荐\n", "\n多条\n"]
+        self.write_baseline(baselines)
+        result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
+        self.assertEqual((result.baseline_rows, result.matched_rows, result.recommended_rows), (8, 7, 5))
+        book = load_workbook(result.destination / "基准匹配结果/story.xlsx")
+        expected = [("中文\n正文", "번역\n본문"), ("\n中文\n正文", "\n번역\n본문"),
+                    ("中文\n正文\n", "번역\n본문\n"), ("\n中文\n正文\n", "\n번역\n본문\n")]
+        for row, (chinese, korean) in enumerate(expected, 2):
+            self.assertEqual(book.active.cell(row, 7).value, baselines[row - 2])
+            self.assertEqual([book.active.cell(row, c).value for c in (18, 21, 24)], [chinese] * 3)
+            self.assertEqual([book.active.cell(row, c).value for c in (19, 22, 25, 30)], [korean] * 4)
+        for row in (6, 7, 8):
+            self.assertIsNone(book.active.cell(row, 30).value)
+        self.assertIsNone(book.active['S6'].value)
+        self.assertEqual(book.active['AG8'].value, '待确认')
+        self.assertIsNone(book.active['R9'].value)
+        self.assertEqual(book.active['AD9'].value, '\n여러\n')
+        self.assertEqual(book.active['AA9'].value, 4)
+        book.close()
+        book = load_workbook(result.destination / "匹配明细.xlsx")
+        self.assertEqual([(row[8], row[9]) for row in list(book['匹配明细'].values)[1:] if row[8] == '中文\n正文'],
+                         [('中文\n正文', '번역\n본문')] * 12)
+        book.close()
 
     def test_counts_details_stats_unicode_and_originals_unchanged(self):
         rows = [["一条", "번역1"], ["  两条  ", "번역2"], ["两条", "번역3"],

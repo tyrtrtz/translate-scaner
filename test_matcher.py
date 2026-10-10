@@ -52,6 +52,111 @@ class TranslationMatches(unittest.TestCase):
         book.close()
         return path
 
+    def test_baseline_headers_move_independently_per_sheet(self):
+        self.write_source([["前一", "앞1"], ["前二", "앞2"], ["前三", "앞3"], ["目标", "추천"]])
+        self.write_source([["其他一", "다른1"], ["其他二", "다른2"], ["其他三", "다른3"], ["目标", "다른 번역"]], name="另一个.xlsx")
+        book = Workbook()
+        book.remove(book.active)
+        layouts = [("左侧", 3, 4, 2, 18), ("右侧", 1, 10, 8, 18), ("宽表", 5, 19, 52, 53)]
+        for name, row, text, translation, _ in layouts:
+            sheet = book.create_sheet(name)
+            if row > 1:
+                sheet['A1'] = '说明页眉'
+                sheet['G2'] = '不是正文'
+            sheet.cell(row, text, " Text \n")
+            sheet.cell(row, translation, "TextTrans")
+            for offset, value in enumerate(("前一", "前二", "前三", "\n目标\n"), 1):
+                sheet.cell(row + offset, text, value)
+                sheet.cell(row + offset, translation, '客户已有译文')
+        path = self.baseline / '不同布局.xlsx'
+        book.save(path)
+        book.close()
+        before = hashlib.sha256(path.read_bytes()).digest()
+        result = match_folder(scan_folder(self.source), self.baseline, self.output)
+        self.assertEqual((result.baseline_rows, result.matched_rows, result.recommended_rows, result.match_pairs), (12, 12, 12, 15))
+        book = load_workbook(result.destination / '基准匹配结果/不同布局.xlsx')
+        for name, row, text, translation, first in layouts:
+            sheet = book[name]
+            self.assertEqual(sheet.cell(row, text).value, ' Text \n')
+            self.assertEqual(sheet.cell(row, translation).value, 'TextTrans')
+            self.assertEqual(sheet.cell(row + 4, translation).value, '客户已有译文')
+            self.assertEqual(sheet.cell(row, first).value, '匹配中文1')
+            self.assertEqual(sheet.cell(row + 4, first + 12).value, '\n추천\n')
+            self.assertEqual(sheet.cell(row + 4, first + 15).value, '上下文推荐')
+            self.assertEqual(sheet.cell(row + 4, first + 9).value, 2)
+            if row > 1:
+                self.assertEqual(sheet['G2'].value, '不是正文')
+                self.assertIsNone(sheet.cell(1, first).value)
+        book.close()
+        book = load_workbook(result.destination / '基准文件匹配统计.xlsx')
+        self.assertEqual({r[2]: r[3:7] for r in list(book['Sheet统计'].values)[1:]},
+                         {name: (4, 4, 4, 4) for name, *_ in layouts})
+        book.close()
+        book = load_workbook(result.destination / '匹配明细.xlsx')
+        targets = [r for r in list(book['匹配明细'].values)[1:] if r[8] == '目标']
+        self.assertEqual({(r[2], r[3]) for r in targets}, {(name, row + 4) for name, row, *_ in layouts})
+        book.close()
+        self.assertEqual(hashlib.sha256(path.read_bytes()).digest(), before)
+
+    def test_baseline_header_errors_include_positions_and_configured_range(self):
+        self.write_source([["中文", "번역"]])
+        path = self.write_baseline(["中文"])
+        for cells, limit, message in (
+            ({'G1': None, 'B3': 'Text'}, 2, '第 1～2 行未找到 Text'),
+            ({'G1': 'Text', 'B1': 'Text'}, 10, '多个 Text：B1、G1'),
+            ({'G1': 'Text', 'B3': 'Text'}, 10, '多个 Text：G1、B3'),
+            ({'G1': 'Text', 'XFD1': 'TextTrans'}, 10, '不足 16 列'),
+        ):
+            with self.subTest(cells=cells):
+                book = Workbook()
+                for coordinate, value in cells.items():
+                    book.active[coordinate] = value
+                book.active['G4'] = '中文'
+                book.save(path)
+                book.close()
+                with self.assertRaisesRegex(ValueError, message):
+                    match_folder(scan_folder(self.source, limit), self.baseline, self.output)
+                self.assertEqual(list(self.output.iterdir()), [])
+        # A header on the last permitted row is accepted, even without TextTrans.
+        book = Workbook()
+        book.active['B3'] = 'Text'
+        book.active['B4'] = '中文'
+        book.save(path)
+        book.close()
+        result = match_folder(scan_folder(self.source, 3), self.baseline, self.output)
+        book = load_workbook(result.destination / '基准匹配结果/story.xlsx')
+        self.assertEqual(book.active['R3'].value, '匹配中文1')
+        self.assertEqual(book.active['AD4'].value, '번역')
+        book.close()
+
+    def test_shifted_results_are_protected_and_cannot_be_used_as_input(self):
+        self.write_source([["中文", "번역"]])
+        path = self.write_baseline(["中文"])
+        book = load_workbook(path)
+        book.active['AZ1'] = 'TextTrans'
+        book.active['BA2'] = '原内容'
+        book.save(path)
+        book.close()
+        report = scan_folder(self.source)
+        with self.assertRaisesRegex(ValueError, 'BA～BP 列已有内容'):
+            match_folder(report, self.baseline, self.output)
+        book = load_workbook(path)
+        book.active['BA2'] = None
+        book.save(path)
+        book.close()
+        result = match_folder(report, self.baseline, self.output)
+        path.write_bytes((result.destination / '基准匹配结果/story.xlsx').read_bytes())
+        with self.assertRaisesRegex(ValueError, '已有检索结果'):
+            match_folder(report, self.baseline, self.output)
+        # Formula rejection follows the identified Text column, too.
+        book = Workbook()
+        book.active['C1'] = 'Text'
+        book.active['C2'] = '=1+1'
+        book.save(path)
+        book.close()
+        with self.assertRaisesRegex(ValueError, '基准中文不能是公式.*C2'):
+            match_folder(report, self.baseline, self.output)
+
     def test_output_boundary_newlines_follow_each_baseline_row(self):
         def preserve_cell_text(path, cells):
             # Without lxml, openpyxl's fixture writer emits literal CR. XML

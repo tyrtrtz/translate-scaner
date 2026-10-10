@@ -458,7 +458,7 @@ class Application:
         self.baseline_folder = tk.StringVar(value=preferences["baseline_folder"])
         self.output_folder = tk.StringVar(value=preferences["output_folder"])
         self.match_inputs = []
-        for label, variable, hint in (("基准文件夹", self.baseline_folder, "支持多个基准文件，按 G 列中文匹配，并结合前后三句推荐译文"),
+        for label, variable, hint in (("基准文件夹", self.baseline_folder, "按 Text 表头定位中文列，表头查找沿用检查行数，结合前后三句推荐译文"),
                                       ("输出文件夹", self.output_folder, "选择独立目录，每次检索生成新的结果副本")):
             ttk.Label(match_content, text=label, style="Card.TLabel").pack(anchor="w", pady=(0, 6))
             line = ttk.Frame(match_content, style="Card.TFrame")

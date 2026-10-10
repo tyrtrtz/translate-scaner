@@ -21,7 +21,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from ignored_sheets import sheet_key
-from scanner import SUPPORTED, hidden_row_numbers, scan_folder
+from scanner import SUPPORTED, hidden_row_numbers, normalize, scan_folder
 
 
 def match_key(value):
@@ -74,23 +74,42 @@ class MatchReport:
     baseline_files: int = 0
 
 
-def baseline_sheets(workbook, path):
+def baseline_sheets(workbook, path, header_rows):
     for sheet in workbook:
         if hasattr(sheet, "reset_dimensions"):
             sheet.reset_dimensions()
-        if sheet.cell(1, 7).value != "Text":
-            raise ValueError(f"基准格式不符：{path.name} / {sheet.title} 的 G1 必须为 Text")
-        yield sheet
+        candidates = []
+        for number, row in enumerate(sheet.iter_rows(max_row=header_rows), 1):
+            headers = {cell.column: normalize(cell.value) for cell in row if cell.value is not None}
+            for column, title in headers.items():
+                if title == "Text":
+                    candidates.append((number, column, headers))
+        location = f"{path.name} / {sheet.title}"
+        if not candidates:
+            raise ValueError(f"基准表头缺失：{location} 的第 1～{header_rows} 行未找到 Text（完整名称匹配，忽略首尾空白）")
+        if len(candidates) > 1:
+            positions = "、".join(f"{get_column_letter(column)}{row}" for row, column, _ in candidates)
+            raise ValueError(f"基准表头不明确：{location} 找到多个 Text：{positions}，请保留唯一的 Text 表头")
+        header_row, text_column, headers = candidates[0]
+        if "匹配中文1" in headers.values() or "推荐状态" in headers.values():
+            raise ValueError(f"{location} 已有检索结果，请提供未回填的基准文件")
+        output_column = max(18, max(headers) + 1)
+        if output_column + 15 > 16384:
+            raise ValueError(f"{location} 的表头右侧不足 16 列，无法写入检索结果")
+        yield sheet, header_row, text_column, output_column
 
 
 class BaselineWriter(XMLGenerator):
-    """Stream original worksheet XML unchanged in meaning, adding R:AG cells."""
+    """Stream original worksheet XML unchanged in meaning, adding result cells."""
 
-    def __init__(self, stream, connection, path, sheet):
+    def __init__(self, stream, connection, path, sheet, header_row, output_column):
         # Avoid the platform's automatic LF -> CRLF conversion in worksheet XML.
         stream = TextIOWrapper(stream, encoding="utf-8", newline="\n", write_through=True)
         super().__init__(stream, encoding="utf-8", short_empty_elements=True)
         self.connection, self.path, self.sheet = connection, str(path), sheet
+        self.header_row = header_row
+        self.column_shift = output_column - 18
+        self.output_letters = {get_column_letter(c) for c in range(output_column, output_column + 16)}
         self.row = None
         self.protected_cell = False
         self.protected_value = False
@@ -118,7 +137,7 @@ class BaselineWriter(XMLGenerator):
             self.row = int(attrs["r"])
         if local == "c":
             column = re.match(r"[A-Z]+", attrs.get("r", "")).group()
-            self.protected_cell = column in {get_column_letter(c) for c in range(18, 34)}
+            self.protected_cell = column in self.output_letters
         if self.protected_cell and local == "f":
             self.existing_content()
         if self.protected_cell and local in ("v", "t"):
@@ -143,17 +162,18 @@ class BaselineWriter(XMLGenerator):
             super().characters(content)
 
     def existing_content(self):
-        raise ValueError(f"{Path(self.path).name} / {self.sheet} 的 R～AG 列已有内容，请提供未回填的基准文件")
+        first, last = (get_column_letter(c + self.column_shift) for c in (18, 33))
+        raise ValueError(f"{Path(self.path).name} / {self.sheet} 的 {first}～{last} 列已有内容，请提供未回填的基准文件")
 
     def output_columns(self):
         for first, last, width in ((18, 26, 45), (27, 29, 18), (30, 32, 55), (33, 33, 24)):
-            super().startElement(self.prefix + "col", {"min": str(first), "max": str(last), "width": str(width), "customWidth": "1"})
+            super().startElement(self.prefix + "col", {"min": str(first + self.column_shift), "max": str(last + self.column_shift), "width": str(width), "customWidth": "1"})
             super().endElement(self.prefix + "col")
 
     def output_cell(self, column, value):
         if value is None:
             return
-        attrs = {"r": f"{get_column_letter(column)}{self.row}"}
+        attrs = {"r": f"{get_column_letter(column + self.column_shift)}{self.row}"}
         if isinstance(value, str):
             attrs["t"] = "inlineStr"
         super().startElement(self.prefix + "c", attrs)
@@ -186,7 +206,7 @@ class BaselineWriter(XMLGenerator):
         if local == "cols":
             self.output_columns()
         if local == "row":
-            if self.row == 1:
+            if self.row == self.header_row:
                 for column in range(18, 27):
                     title = ("匹配中文", "匹配韩语", "来源路径 / Sheet / 行号")[(column - 18) % 3]
                     self.output_cell(column, f"{title}{(column - 18) // 3 + 1}")
@@ -236,7 +256,7 @@ def write_baseline_copy(path, destination, connection, sheets):
         for item in source.infolist():
             with source.open(item) as original, output.open(item, "w") as copied:
                 if item.filename in sheets:
-                    writer = BaselineWriter(copied, connection, path, sheets[item.filename])
+                    writer = BaselineWriter(copied, connection, path, *sheets[item.filename])
                     parser = create_parser()
                     parser.setFeature(feature_external_ges, False)
                     parser.setContentHandler(writer)
@@ -398,7 +418,7 @@ def write_baseline_statistics(destination, connection, baseline_parts):
         values = counts(path)
         total = [a + b for a, b in zip(total, values)]
         file_rows.append([path.name, str(path), *with_rates(values)])
-        for sheet in parts.values():
+        for sheet, _, _ in parts.values():
             sheet_rows.append([path.name, str(path), sheet, *with_rates(counts(path, sheet))])
     write_detail_sheet(book, "文件统计", ["文件名", "完整路径", *headers], file_rows, [35, 65, *([20] * len(headers))])
     write_detail_sheet(book, "Sheet统计", ["文件名", "完整路径", "Sheet", *headers], sheet_rows, [35, 65, 25, *([20] * len(headers))])
@@ -568,10 +588,10 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                     progress(f"读取基准中文：{path.name}")
                 book = load_workbook(path, read_only=True, data_only=False, keep_links=False)
                 try:
-                    for sheet in baseline_sheets(book, path):
-                        baseline_parts.setdefault(path, {})[sheet._worksheet_path.lstrip("/")] = sheet.title
+                    for sheet, header_row, text_column, output_column in baseline_sheets(book, path, report.header_rows):
+                        baseline_parts.setdefault(path, {})[sheet._worksheet_path.lstrip("/")] = (sheet.title, header_row, output_column)
                         sequence = 0
-                        for row in sheet.iter_rows(min_row=2, min_col=7, max_col=7):
+                        for row in sheet.iter_rows(min_row=header_row + 1, min_col=text_column, max_col=text_column):
                             cell = row[0]
                             if cell.data_type == "f":
                                 raise ValueError(f"基准中文不能是公式：{path.name} / {sheet.title} / {cell.coordinate}")
@@ -585,7 +605,7 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                 finally:
                     book.close()
             if not baseline_rows:
-                raise ValueError("基准文件 G 列没有非空中文文本")
+                raise ValueError("基准文件的 Text 列没有非空中文文本")
             connection.commit()
             for index, (path, results) in enumerate(candidates.items(), 1):
                 if progress:

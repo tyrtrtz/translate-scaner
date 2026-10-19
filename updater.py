@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 REPOSITORY = "tyrtrtz/translate-scaner"
 ASSET_NAME = "HeaderChecker.exe"
 

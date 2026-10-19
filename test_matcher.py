@@ -533,6 +533,66 @@ class TranslationMatches(unittest.TestCase):
         self.assertTrue(all(s.max_row<=3 for s in book))
         book.close()
 
+    def test_unrecommended_details_classify_each_source_row_once(self):
+        path = self.write_source([["唯一", "번역"], [" 唯一 ", "번역"], ["缺译", None],
+                                  ["冲突", "甲"], ["空白", None], ["只在源里", " 원문\n"],
+                                  ["=未匹配", "=번역"], ["排除隐藏行", "不参与"]], name="A.xlsx")
+        self.write_source([["冲突", "乙"], ["空白", " \t "]], name="B.xlsx")
+        book = load_workbook(path)
+        book.active['A8'].data_type = book.active['B8'].data_type = 's'
+        book.active.row_dimensions[9].hidden = True
+        for name in ('忽略', '异常', '读取失败', '隐藏表'):
+            sheet = book.create_sheet(name)
+            sheet.append(['台词', '未知' if name == '异常' else '韩文'])
+            sheet.append(['不应列出', '不参与'])
+            if name == '读取失败':
+                sheet.append(['失败公式', '=1+1'])
+            if name == '隐藏表':
+                sheet.sheet_state = 'hidden'
+        book.save(path)
+        book.close()
+        ignored = {sheet_key(path, '忽略')}
+        # The same chosen source is reused by multiple baselines, never duplicated here.
+        self.write_baseline(['唯一'], name='A.xlsx')
+        self.write_baseline(['唯一'], name='B.xlsx')
+        self.write_baseline(['缺译', '冲突', '空白'], name='C.xlsx')
+        report = scan_folder(self.source, 1, ignored_sheets=ignored,
+                             include_hidden_sheets=False, include_hidden_rows=False)
+        result = match_folder(report, self.baseline, self.output, ignored_sheets=ignored)
+        self.assertEqual((result.source_rows, result.source_matched, result.recommended_rows), (9, 7, 2))
+        book = load_workbook(result.destination / '匹配明细.xlsx')
+        sheet = book['未推荐明细']
+        records = list(sheet.values)
+        self.assertEqual(records[0], ('源文件名','源完整路径','源 Sheet','源行号','源中文','韩语','命中基准','缺译','未推荐原因'))
+        rows = {(r[0], r[3]): r for r in records[1:]}
+        self.assertEqual(set(rows), {('A.xlsx', i) for i in range(3, 9)} | {('B.xlsx', 2), ('B.xlsx', 3)})
+        self.assertEqual(len(records) - 1, len(rows))
+        for key, row in rows.items():
+            unmatched = key in {('A.xlsx', 7), ('A.xlsx', 8)}
+            self.assertEqual(row[6], '否' if unmatched else '是')
+            self.assertEqual(row[8], '基准文件中找不到' if unmatched else '基准文件中找到了但不符合推荐规则')
+            self.assertEqual(row[2], '正文')
+        self.assertEqual(rows['A.xlsx', 3][4], ' 唯一 ')
+        self.assertEqual(rows['A.xlsx', 7][5], ' 원문\n')
+        self.assertEqual(rows['A.xlsx', 4][7], '是')
+        self.assertEqual(rows['B.xlsx', 3][5:8], (' \t ', '是', '是'))
+        formula_row = next(cell.row for row in sheet for cell in row if cell.value == '=未匹配')
+        self.assertEqual(sheet.cell(formula_row, 5).data_type, 's')
+        self.assertEqual(sheet.cell(formula_row, 6).data_type, 's')
+        self.assertEqual(sheet.freeze_panes, 'A2')
+        self.assertEqual(sheet.auto_filter.ref, 'A1:I9')
+        book.close()
+
+    def test_unrecommended_details_empty_still_has_headers(self):
+        self.write_source([['中文', '번역']])
+        self.write_baseline(['中文'])
+        result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
+        book = load_workbook(result.destination / '匹配明细.xlsx')
+        self.assertEqual(list(book['未推荐明细'].values),
+                         [('源文件名','源完整路径','源 Sheet','源行号','源中文','韩语','命中基准','缺译','未推荐原因')])
+        self.assertEqual(book['未推荐明细'].auto_filter.ref, 'A1:I1')
+        book.close()
+
     def test_context_recommends_per_baseline_and_keeps_full_evidence(self):
         a = ["甲前一", "甲前二", "甲前三", "共同句", "甲后一", "甲后二", "甲后三"]
         b = ["乙前一", "乙前二", "乙前三", "共同句", "乙后一", "乙后二", "乙后三"]
@@ -561,6 +621,10 @@ class TranslationMatches(unittest.TestCase):
         self.assertEqual({r["韩语"] for r in selected}, {"韩甲", "韩乙"})
         self.assertTrue(all(r["完整一致侧数"] == 2 and r["一致位置总数"] == 6 for r in selected))
         self.assertIn("前1句 [行4] 甲前三", selected[0]["基准前3句"])
+        unused = [r for r in list(book['未推荐明细'].values)[1:] if r[4] == '共同句']
+        # A and B are chosen in different baselines; only C and D remain.
+        self.assertEqual({r[0] for r in unused}, {'C.xlsx', 'D.xlsx'})
+        self.assertTrue(all(r[8] == '基准文件中找到了但不符合推荐规则' for r in unused))
         book.close()
         book = load_workbook(result.destination / "基准文件匹配统计.xlsx")
         for row in list(book["文件统计"].values)[1:]:

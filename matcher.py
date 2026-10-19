@@ -338,6 +338,7 @@ def build_recommendations(connection, progress=None):
             PRIMARY KEY(path,sheet,row,source_id));
         CREATE TABLE recommendations (path TEXT,sheet TEXT,row INTEGER,source_id INTEGER,basis TEXT,status TEXT,
             PRIMARY KEY(path,sheet,row));
+        CREATE INDEX recommendation_source ON recommendations(source_id);
     """)
     for source_id, path, sheet, sequence in connection.execute("SELECT rowid,path,sheet,seq FROM hits"):
         previous, following = read_context(connection, "source_rows", path, sheet, sequence)
@@ -468,6 +469,21 @@ def write_matching_details(destination, connection, progress=None):
                 for p,sheet,row,cn,ko,matched,missing,variants in records)
         write_detail_sheet(book, title, ["源文件名","源完整路径","源 Sheet","源行号","源中文","韩语","命中基准","缺译","非空韩语种类数"],
                            rows, [35,65,25,16,55,55,16,12,24], progress)
+    records = connection.execute("""
+        SELECT s.path,s.sheet,s.row,s.chinese,s.korean,
+               CASE WHEN t.text IS NOT NULL THEN '是' ELSE '否' END,
+               CASE WHEN s.korean_key='' THEN '是' ELSE '否' END,
+               CASE WHEN t.text IS NULL THEN '基准文件中找不到'
+                    ELSE '基准文件中找到了但不符合推荐规则' END
+        FROM source_rows s LEFT JOIN targets t ON t.text=s.text
+        WHERE NOT EXISTS (SELECT 1 FROM recommendations r WHERE r.source_id=s.rowid)
+        ORDER BY s.rowid
+    """)
+    rows = ([Path(p).name,p,sheet,row,cn,ko,matched,missing,reason]
+            for p,sheet,row,cn,ko,matched,missing,reason in records)
+    write_detail_sheet(book, "未推荐明细",
+                       ["源文件名","源完整路径","源 Sheet","源行号","源中文","韩语","命中基准","缺译","未推荐原因"],
+                       rows, [35,65,25,16,55,55,16,12,55], progress)
     book.save(destination)
     book.close()
     return pairs
@@ -684,7 +700,7 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                 matched_rows += write_baseline_copy(path, destination, connection, baseline_parts[path])
                 outputs.append(Path("基准匹配结果") / relative)
             if progress:
-                progress("写出匹配、未匹配、缺译及冲突明细……")
+                progress("写出匹配、未匹配、缺译、冲突及未推荐明细……")
             match_pairs = write_matching_details(staging / "匹配明细.xlsx", connection, progress)
             outputs.append(Path("匹配明细.xlsx"))
             write_baseline_statistics(staging / "基准文件匹配统计.xlsx", connection, baseline_parts)

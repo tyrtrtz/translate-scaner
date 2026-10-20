@@ -10,7 +10,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
 
 from ignored_sheets import sheet_key
-from matcher import align_boundary_newlines, match_folder, plain_key, write_detail_sheet
+from matcher import align_boundary_newlines, breath_key, match_folder, plain_key, write_detail_sheet
 from scanner import scan_folder
 
 
@@ -481,8 +481,9 @@ class TranslationMatches(unittest.TestCase):
         book.close()
         book = load_workbook(result.destination / '匹配明细.xlsx')
         rows = list(book['匹配明细'].values)
-        self.assertEqual(rows[0][-1], '匹配方式')
-        self.assertEqual({r[8]:r[-1] for r in rows[1:]},
+        self.assertEqual(rows[0][23], '匹配方式')
+        self.assertEqual(rows[0][-1], '上下文查询统计')
+        self.assertEqual({r[8]:r[23] for r in rows[1:]},
                          {'这是基准文件的原文':'纯文本补匹配','{playername}你好\\n世界':'纯文本补匹配','精确优先':'全文精确匹配'})
         unused = list(book['未推荐明细'].values)[1:]
         self.assertFalse(any(r[4] in ('这是基准文件的原文','{playername}你好\\n世界') for r in unused))
@@ -510,7 +511,7 @@ class TranslationMatches(unittest.TestCase):
         book = load_workbook(result.destination / '匹配明细.xlsx')
         rows = list(book['匹配明细'].values)[1:]
         self.assertTrue(all(r[20]=='是' for r in rows))
-        self.assertEqual({r[0]:r[-1] for r in rows}, {'A.xlsx':'全文精确匹配','B.xlsx':'纯文本补匹配'})
+        self.assertEqual({r[0]:r[23] for r in rows}, {'A.xlsx':'全文精确匹配','B.xlsx':'纯文本补匹配'})
         self.assertEqual(list(book['未推荐明细'].values)[1:], [])
         book.close()
 
@@ -534,7 +535,7 @@ class TranslationMatches(unittest.TestCase):
         self.assertEqual(chosen[14], '前1句 [行5] 前3\n前2句 [行4] 前2\n前3句 [行2] 前1')
         self.assertEqual(chosen[15], '后1句 [行7] 后1\n后2句 [行9] 后2\n后3句 [行10] 后3')
         self.assertEqual(chosen[16:20], (3,3,2,6))
-        self.assertEqual(chosen[-1], '纯文本补匹配')
+        self.assertEqual(chosen[23], '纯文本补匹配')
         self.assertTrue(any(r[0]=='B.xlsx' and r[4]=='争议' and r[6]=='是' for r in list(book['未推荐明细'].values)[1:]))
         book.close()
 
@@ -806,6 +807,10 @@ class TranslationMatches(unittest.TestCase):
         self.assertEqual(book.active["AG5"].value, "待确认")
         self.assertIn("最高上下文得分", book.active["AF5"].value)
         book.close()
+        book = load_workbook(result.destination / "匹配明细.xlsx")
+        tied = [r for r in list(book["匹配明细"].values)[1:] if r[8] == "争议"]
+        self.assertEqual({(r[20], r[21], r[24]) for r in tied}, {("否", "待确认", "是")})
+        book.close()
         # At a boundary, even two identical neighbours are insufficient for a conflict.
         self.write_baseline(["争议", "后1", "后2"])
         result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
@@ -826,7 +831,140 @@ class TranslationMatches(unittest.TestCase):
         book = load_workbook(result.destination / "基准匹配结果/story.xlsx")
         self.assertEqual(book.active["AD2"].value, "韩甲")
         self.assertIn("前0/3句一致，后3/3句一致", book.active["AF2"].value)
+        self.assertIn("非完美匹配", book.active["AF2"].value)
         book.close()
+
+    def test_special_context_extends_repeatedly_cleans_information_and_counts_blank_stage(self):
+        # Ten special rows require going beyond a fixed 3 + 3 window.
+        for plain in (False, True):
+            with self.subTest(plain=plain):
+                path = self.write_source([])
+                book = load_workbook(path)
+                sheet = book.active
+                sheet.append(["前1", "译文", "", "角色"])
+                sheet.append(["前2", "译文", "", "角色"])
+                sheet.append(["前3", "译文", "奇波", "角色"])
+                sheet.append(["场景说明", "설명", "", ""])
+                sheet.append(["嗯？（惊讶）", "응? (놀람)", " 气息 ", "角色"])
+                for _ in range(9):
+                    sheet.append([None, None, "演出", None])
+                sheet.append(["目标", "正确", "", "角色"])  # row 16
+                sheet.append(["（半疑惑的气）", "(의문)", "气息", "角色"])
+                sheet.append(["镜头移动", None, "演出", ""])
+                sheet.append(["后1", "译文", "", "角色"])
+                sheet.append(["哈(喘息)", "하", "气息", "角色"])
+                sheet.append(["后2", "译文", "演出说明", "角色"])
+                sheet.append(["后3", "译文", "", "角色"])
+                sheet["C1"], sheet["D1"] = "特殊说明", "说话角色名"
+                if plain:
+                    for row in (2, 3, 4, 19, 21, 22):
+                        sheet.cell(row, 1, f"<b>{sheet.cell(row, 1).value}</b>")
+                book.save(path)
+                book.close()
+                self.write_source([["其他1", "译文"], ["其他2", "译文"], ["其他3", "译文"],
+                                   ["目标", "错误"], ["另后1", "译文"]], name="错误.xlsx")
+                # One breath also exists in baseline; other special rows are source-only.
+                baseline = self.write_baseline(["前1", "前2", "前3", "嗯？（不同说明）",
+                                                "目标", "后1", "哈", "后2", "后3"])
+                before = {p: hashlib.sha256(p.read_bytes()).digest() for p in (path, baseline)}
+                result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
+                book = load_workbook(result.destination / "匹配明细.xlsx")
+                values = list(book["匹配明细"].values)
+                selected = next(dict(zip(values[0], r)) for r in values[1:] if r[8] == "目标" and r[20] == "是")
+                self.assertEqual(selected["韩语"], "正确")
+                self.assertEqual(selected["完美匹配"], "是")
+                self.assertEqual(selected["匹配方式"], "纯文本补匹配" if plain else "全文精确匹配")
+                self.assertEqual(selected["上下文查询统计"],
+                    "向上：查询13行，演出9行，气息1行，匹配3句\n"
+                    "向下：查询6行，演出1行，气息2行，匹配3句\n"
+                    "合计（不含当前句）：查询19行，演出10行，气息3行，匹配6句")
+                self.assertEqual(selected["来源前3句"], "前1句 [行4] 前3\n前2句 [行3] 前2\n前3句 [行2] 前1")
+                self.assertEqual(selected["来源后3句"], "后1句 [行19] 后1\n后2句 [行21] 后2\n后3句 [行22] 后3")
+                self.assertIn("同时越过基准行5", selected["上下文跳过位置"])
+                self.assertIn("同时越过基准行8", selected["上下文跳过位置"])
+                self.assertNotIn("场景说明", str(values))
+                excluded = list(book["上下文排除明细"].values)[1:]
+                self.assertEqual(len(excluded), 14)
+                self.assertTrue(any(r[2] == 5 and "两列均为空" in r[-1] for r in excluded))
+                book.close()
+                book = load_workbook(result.destination / "基准匹配结果/story.xlsx")
+                self.assertEqual(book.active["AD6"].value, "正确")
+                self.assertIn("完美匹配：上下各3句", book.active["AF6"].value)
+                book.close()
+                self.assertEqual(before, {p: hashlib.sha256(p.read_bytes()).digest() for p in before})
+
+    def test_breath_brackets_only_affect_breath_rows_and_preserve_translation(self):
+        path = self.write_source([["嗯？（惊讶(小声)）", "응? (놀람)", "气息"],
+                                  ["正常(说明)", "일반", ""],
+                                  ["哈(喘息)", "하", "气息"],
+                                  ["（只有说明）", "(설명)", "气息"],
+                                  ["哎（未闭合", "아", "气息"]])
+        book = load_workbook(path)
+        book.active["C1"] = "特殊说明"  # Missing speaker header must not drop normal rows.
+        book.save(path)
+        book.close()
+        self.write_baseline(["嗯？", "嗯？（惊讶(小声)）", "嗯？(别的说明)", "<b>哈</b>",
+                             "正常", "正常(说明)", "哎"])
+        result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
+        self.assertEqual((result.matched_rows, result.source_matched, result.match_pairs), (5, 3, 5))
+        book = load_workbook(result.destination / "匹配明细.xlsx")
+        rows = list(book["匹配明细"].values)[1:]
+        breath_rows = [r for r in rows if r[8].startswith("嗯")]
+        self.assertEqual(len(breath_rows), 3)
+        self.assertEqual({r[9] for r in breath_rows}, {"응? (놀람)"})
+        self.assertEqual({r[23] for r in breath_rows}, {"全文精确匹配", "气息去括号匹配"})
+        self.assertTrue(all(r[24] == "否" for r in breath_rows))
+        self.assertEqual(next(r[23] for r in rows if r[8] == "哈(喘息)"), "纯文本补匹配")
+        book.close()
+        self.assertEqual(breath_key("啊（动作）哈(小声)"), "啊哈")
+        self.assertEqual(breath_key(" （只有说明） "), "")
+        self.assertEqual(breath_key("嗯（不配对)"), "嗯（不配对)")
+        self.assertEqual(breath_key("哎（未闭合"), "哎（未闭合")
+
+    def test_special_context_stops_at_sheet_boundary_and_does_not_skip_normal_mismatch(self):
+        path = self.write_source([["目标", "译文"], ["错误邻句", "译文"],
+                                  [None, None, "演出"], ["（动作）", None, "气息"],
+                                  ["后2", "译文"], ["后3", "译文"], ["后1", "译文"]])
+        book = load_workbook(path)
+        book.active["C1"] = "特殊说明"
+        other = book.create_sheet("不能跨Sheet补句")
+        other.append(["台词", "한국어"])
+        other.append(["前1", "译文"])
+        book.save(path)
+        book.close()
+        self.write_baseline(["前1", "前2", "前3", "目标", "后1", "后2", "后3"])
+        result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
+        book = load_workbook(result.destination / "匹配明细.xlsx")
+        row = next(r for r in list(book["匹配明细"].values)[1:] if r[8] == "目标")
+        self.assertEqual(row[16:20], (0, 2, 0, 2))
+        self.assertEqual(row[24], "否")
+        self.assertEqual(row[-1], "向上：查询0行，演出0行，气息0行，匹配0句\n"
+                         "向下：查询5行，演出1行，气息1行，匹配2句\n"
+                         "合计（不含当前句）：查询5行，演出1行，气息1行，匹配2句")
+        self.assertIsNone(row[14])
+        book.close()
+
+    def test_context_metadata_validation_rolls_back_all_evidence(self):
+        self.write_source([["安全", "번역"]], name="安全.xlsx")
+        self.write_baseline(["安全", "失败"])
+        for metadata in (("C3", "=1+1", "特殊说明含公式"),
+                         ("D3", "=1+1", "说话角色名含公式"),
+                         ("E1", "特殊说明", "多个特殊说明列"),
+                         ("E1", "说话角色名", "多个说话角色名列")):
+            with self.subTest(metadata=metadata):
+                path = self.write_source([["先读的气息(动作)", "译文", "气息", "角色"],
+                                          ["失败", "错误", "", "角色"]])
+                book = load_workbook(path)
+                book.active["C1"], book.active["D1"] = "特殊说明", "说话角色名"
+                book.active[metadata[0]] = metadata[1]
+                book.save(path)
+                book.close()
+                result = match_folder(scan_folder(self.source, 1, include_deprecated=True), self.baseline, self.output)
+                self.assertEqual(result.source_rows, 1)
+                self.assertTrue(any(metadata[2] in r.issue for r in result.check_report.results if r.issue))
+                book = load_workbook(result.destination / "匹配明细.xlsx")
+                self.assertEqual(book["上下文排除明细"].max_row, 1)
+                book.close()
 
     def test_many_baselines_summary_empty_missing_and_source_deduplication(self):
         self.write_source([["唯一", " 번역 "], ["唯一", "번역"], ["缺译", None]])

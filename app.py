@@ -13,6 +13,7 @@ from tkinter import filedialog, font as tkfont, messagebox, ttk
 from scanner import export_exceptions, scan_folder
 from ignored_sheets import default_ignore_file, load_ignored, save_ignored, sheet_key
 from matcher import match_folder
+from structure_scan import scan_structure
 from settings import default_settings, load_settings, save_settings
 from updater import VERSION, can_install_updates, check_for_update, download_update, start_installation
 
@@ -453,23 +454,22 @@ class Application:
         match_panel.pack(fill="both", expand=True)
         match_content = match_panel.content
         self.tabs.add(self.match_tab, text="译文检索")
-        ttk.Label(match_content, text="从检查，到译文匹配", style="Section.TLabel").pack(anchor="w")
         self.match_hint = ttk.Label(match_content, text="先完成表头检查，通过的工作表即可参与检索。", style="CardMuted.TLabel", wraplength=620)
         self.match_hint.pack(anchor="w", pady=(4, 8))
         self.baseline_folder = tk.StringVar(value=preferences["baseline_folder"])
         self.output_folder = tk.StringVar(value=preferences["output_folder"])
         self.match_inputs = []
-        for label, variable, hint in (("基准文件夹", self.baseline_folder, "按 Text 表头定位中文列，表头查找沿用检查行数，结合前后三句推荐译文"),
-                                      ("输出文件夹", self.output_folder, "选择独立目录，每次检索生成新的结果副本")):
-            ttk.Label(match_content, text=label, style="Card.TLabel").pack(anchor="w", pady=(0, 6))
+        for label, variable, hint in (("基准文件夹", self.baseline_folder, "按 Text 列查找中文，结合前后文推荐译文"),
+                                      ("输出文件夹", self.output_folder, "每次生成新结果；复核记录保存在此目录")):
             line = ttk.Frame(match_content, style="Card.TFrame")
             line.pack(fill="x")
-            field, entry = rounded_entry(line, variable)
-            field.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            ttk.Label(line, text=label, style="Card.TLabel").pack(side="left", padx=(0, 8))
             button = ttk.Button(line, text="选择文件夹", command=lambda v=variable, t=label: self.browse_match(v, t))
-            button.pack(side="left")
+            button.pack(side="right")
+            field, entry = rounded_entry(line, variable, width=12)
+            field.pack(side="left", fill="x", expand=True, padx=(0, 8))
             self.match_inputs.extend((entry, button))
-            ttk.Label(match_content, text=hint, style="CardMuted.TLabel").pack(anchor="w", pady=(6, 14))
+            ttk.Label(match_content, text=hint, style="CardMuted.TLabel").pack(anchor="w", pady=(4, 8))
         ttk.Separator(match_content).pack(fill="x", pady=(0, 10))
         line = ttk.Frame(match_content, style="Card.TFrame")
         line.pack(fill="x")
@@ -479,7 +479,34 @@ class Application:
         self.match_open_button.pack(side="left", padx=8)
         self.match_details_button = ttk.Button(line, text="打开匹配明细", command=self.open_match_details, state="disabled")
         self.match_details_button.pack(side="left")
-        ttk.Label(match_content, text="检索结果", style="Section.TLabel").pack(anchor="w", pady=(20, 8))
+        self.structure_report = None
+        self.structure_running = False
+        self.review_report_file = tk.StringVar()
+        line = ttk.Frame(match_content, style="Card.TFrame")
+        line.pack(fill="x", pady=(10, 0))
+        self.structure_button = ttk.Button(line, text="扫描并试合并/拆分", command=lambda: self.start_match(structure=True), state="disabled")
+        self.structure_button.pack(side="left")
+        ttk.Label(line, text="最多连续行数", style="Card.TLabel").pack(side="left", padx=(12, 4))
+        self.structure_max_rows = tk.StringVar(value="8")
+        self.structure_rows_entry = ttk.Spinbox(line, from_=2, to=50, width=4, textvariable=self.structure_max_rows)
+        self.structure_rows_entry.pack(side="left")
+        self.match_inputs.append(self.structure_rows_entry)
+        self.review_file_button = ttk.Button(line, text="选择复核文件", command=self.browse_review_report)
+        self.review_file_button.pack(side="left", padx=(12, 6))
+        self.review_clear_button = ttk.Button(line, text="清除", command=lambda: self.review_report_file.set(""))
+        self.review_clear_button.pack(side="left")
+        self.match_inputs.extend((self.review_file_button, self.review_clear_button))
+        self.review_report_file.trace_add("write", lambda *_: self.review_file_button.configure(
+            text="已选复核文件" if self.review_report_file.get() else "选择复核文件"))
+        line = ttk.Frame(match_content, style="Card.TFrame")
+        line.pack(fill="x", pady=(8, 0))
+        self.structure_open_button = ttk.Button(line, text="打开扫描报告", command=self.open_structure_report, state="disabled")
+        self.structure_open_button.pack(side="left")
+        self.merge_open_button = ttk.Button(line, text="打开试合并", command=lambda: self.open_structure_report("试合并结果.xlsx"), state="disabled")
+        self.merge_open_button.pack(side="left", padx=8)
+        self.trial_open_button = ttk.Button(line, text="打开试拆分", command=lambda: self.open_structure_report("试拆分结果.xlsx"), state="disabled")
+        self.trial_open_button.pack(side="left")
+        ttk.Label(match_content, text="运行结果", style="Section.TLabel").pack(anchor="w", pady=(8, 4))
         self.match_summary = tk.StringVar(value="等待检索。完成后将在这里显示匹配统计与结果位置。")
         summary_frame = ttk.Frame(match_content, style="Card.TFrame")
         summary_frame.pack(fill="both", expand=True)
@@ -494,8 +521,8 @@ class Application:
         summary_frame.columnconfigure(0, weight=1)
         self.match_summary.trace_add("write", self.render_match_summary)
         self.render_match_summary()
-        self.match_rules_label = ttk.Label(match_content, text="异常及已忽略工作表自动跳过。候选译文写入副本 R～Z 列，AA～AC 列记录条数、缺译与冲突；完整来源另存匹配明细。", style="CardMuted.TLabel", wraplength=620, justify="left")
-        self.match_rules_label.pack(side="bottom", anchor="w", fill="x", pady=(16, 0), before=summary_frame)
+        self.match_rules_label = ttk.Label(match_content, text="原文件只读；常规匹配写入副本，结构扫描生成独立预览。", style="CardMuted.TLabel", wraplength=620, justify="left")
+        self.match_rules_label.pack(side="bottom", anchor="w", fill="x", pady=(4, 0), before=summary_frame)
         match_content.bind("<Configure>", self.resize_match_text)
 
         self.ignored_tab = ttk.Frame(self.tabs)
@@ -615,7 +642,8 @@ class Application:
         self.running = running
         self.update_overview()
         self.start_button.configure(text="正在检查…" if running and self.report is None else "开始表头检查  →")
-        self.match_button.configure(text="正在检索…" if running and self.report is not None else "检索并生成结果  →")
+        self.match_button.configure(text="正在检索…" if running and self.report is not None and not self.structure_running else "检索并生成结果  →")
+        self.structure_button.configure(text="正在扫描…" if running and self.structure_running else "扫描并试合并/拆分")
         for widget in (self.start_button, self.browse_button, self.folder_entry, self.row_entry, *self.match_inputs, *self.scan_switches):
             widget.configure(state="disabled" if running else "normal")
         if self.ignore_error:
@@ -628,6 +656,10 @@ class Application:
         self.ignore_button.configure(state="normal" if available and self.table.checked_items() and not self.ignore_error else "disabled")
         self.restore_button.configure(state="normal" if not running and self.ignored_table.checked_items() and not self.ignore_error else "disabled")
         self.match_button.configure(state="normal" if available and self.report.passed_sheets and not self.ignore_error else "disabled")
+        self.structure_button.configure(state="normal" if available and self.report.passed_sheets and not self.ignore_error else "disabled")
+        self.structure_open_button.configure(state="normal" if not running and self.structure_report else "disabled")
+        self.trial_open_button.configure(state="normal" if not running and self.structure_report else "disabled")
+        self.merge_open_button.configure(state="normal" if not running and self.structure_report else "disabled")
         self.match_open_button.configure(state="normal" if not running and self.match_report else "disabled")
         self.match_details_button.configure(state="normal" if not running and self.match_report else "disabled")
         self.save_settings_button.configure(state="normal" if not running and not self.settings_error else "disabled")
@@ -705,7 +737,7 @@ class Application:
         if folder:
             variable.set(folder)
 
-    def start_match(self):
+    def start_match(self, structure=False):
         if self.running or self.report is None or self.ignore_error:
             return
         try:
@@ -722,26 +754,55 @@ class Application:
             output = self.output_folder.get().strip()
             if not baseline or not output:
                 raise ValueError("请选择基准文件夹和输出文件夹")
+            if structure:
+                review_report = self.review_report_file.get().strip()
+                if review_report and not Path(review_report).expanduser().is_file():
+                    raise ValueError("复核文件不存在，请重新选择；留空则沿用已保存的复核记录")
+                try:
+                    max_rows = int(self.structure_max_rows.get())
+                except ValueError:
+                    raise ValueError("最大连续行数必须是 2～50 的整数") from None
+                if not 2 <= max_rows <= 50:
+                    raise ValueError("最大连续行数必须是 2～50 的整数")
         except ValueError as error:
-            messagebox.showerror("无法开始检索", str(error))
+            messagebox.showerror("无法开始扫描" if structure else "无法开始检索", str(error))
             return
         report, ignored, events = self.report, set(self.ignored), self.events
         self.store_settings()
-        self.match_report = None
-        self.match_summary.set("正在检索，完成后显示结果位置。")
+        self.structure_running = structure
+        if structure:
+            self.structure_report = None
+        else:
+            self.match_report = None
+        self.match_summary.set("正在检查整句匹配，再仅对 char.xlsx 反查合并；同时生成试拆分预览。" if structure else "正在检索，完成后显示结果位置。")
         self.set_running(True)
         self.progress.configure(mode="indeterminate")
         self.progress.start(15)
 
         def work():
             try:
-                result = match_folder(report, baseline, output, ignored_sheets=ignored,
-                                      progress=lambda text: events.put(("match_progress", text)))
-                events.put(("match_done", result))
+                operation = scan_structure if structure else match_folder
+                result = operation(report, baseline, output, ignored_sheets=ignored,
+                                   progress=lambda text: events.put(("match_progress", text)),
+                                   **({"max_rows": max_rows, "review_report": Path(review_report).expanduser() if review_report else None} if structure else {}))
+                events.put(("structure_done" if structure else "match_done", result))
             except Exception as error:
-                events.put(("match_error", str(error)))
+                events.put(("structure_error" if structure else "match_error", str(error)))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def browse_review_report(self):
+        path = filedialog.askopenfilename(title="选择已填写“复核填写”的试合并结果",
+                                          filetypes=[("Excel 工作簿", "*.xlsx")])
+        if path:
+            self.review_report_file.set(path)
+
+    def open_structure_report(self, filename="结构差异扫描.xlsx"):
+        if self.structure_report:
+            try:
+                open_path(self.structure_report.destination / filename)
+            except OSError as error:
+                messagebox.showerror("无法打开扫描报告", str(error))
 
     def open_match_output(self):
         if self.match_report:
@@ -815,6 +876,29 @@ class Application:
                     messagebox.showerror("检查失败", value)
                 elif kind == "match_progress":
                     self.status.set(value)
+                elif kind in ("structure_done", "structure_error"):
+                    self.progress.stop()
+                    self.progress.configure(mode="determinate", value=0)
+                    self.structure_running = False
+                    if kind == "structure_done":
+                        self.structure_report = value
+                        self.review_report_file.set("")
+                        self.report = value.check_report
+                        self.refresh_exceptions()
+                        summary = (f"扫描完成：台本 {value.source_rows} 行、基准 {value.baseline_rows} 行；"
+                                   f"合并候选 {value.merge_candidates} 条、拆分候选 {value.split_candidates} 条。\n"
+                                   f"中韩格式样本 {value.pattern_samples} 条；未解释 {value.unresolved} 行；跳过或排除记录 {value.skipped} 项。\n"
+                                   f"全部基准整句命中 {value.whole_matched_rows} 行；合并仅限 char.xlsx：建议 {value.merge_trial_rows} 行、待确认 {value.merge_pending_rows} 行、不适用 {value.merge_rejected_rows} 行。\n"
+                                   f"试拆分 {value.trial_groups} 组 / {value.trial_segments} 条；暂不拆分 {value.trial_pending} 个源行。\n"
+                                   f"结果位置：{value.destination}\n"
+                                   "打开试合并后可填写“复核填写”，选择该复核文件重跑；复核自动保存，内容变化后需重审。")
+                        self.match_summary.set(summary)
+                        self.status.set(summary.split("\n")[0])
+                    else:
+                        self.match_summary.set("扫描失败，未生成本次结果。请处理错误后重试。")
+                        self.status.set("结构扫描未完成。")
+                        messagebox.showerror("扫描失败", value)
+                    self.set_running(False)
                 elif kind in ("match_done", "match_error"):
                     self.progress.stop()
                     self.progress.configure(mode="determinate", value=0)

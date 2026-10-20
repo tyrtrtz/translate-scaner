@@ -15,3 +15,4 @@ outputs/
 *.csv
 ignored_sheets.json
 settings.json
+/TODO.md

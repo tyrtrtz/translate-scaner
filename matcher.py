@@ -29,11 +29,53 @@ def match_key(value):
 
 
 PLAIN_REVIEW_NOTE = "仅纯文本匹配，仍需复核标签"
-CODE_TAGS = re.compile(r"\{[^{}\r\n]*\}|</?[A-Za-z][^<>\r\n]*>|\\[nr]|[\r\n]")
+CONTEXT_SKIP_NOTES = {"演出", "气息"}
+TEXT_TAG = re.compile(r"</?[A-Za-z][^<>\r\n]*>")
+CODE_TAGS = re.compile(r"\{[^{}\r\n]*\}|\\[nr]|[\r\n]")
 
 
 def plain_key(value):
-    return CODE_TAGS.sub("", match_key(value)).strip()
+    return CODE_TAGS.sub("", TEXT_TAG.sub("", match_key(value))).strip()
+
+
+def source_metadata_columns(header):
+    columns = []
+    for name in ("特殊说明", "说话角色名"):
+        found = [c.column for c in header if normalize(c.value) == name]
+        if len(found) > 1:
+            raise ValueError(f"存在多个{name}列，无法判断上下文清理规则")
+        columns.append(found[0] if found else None)
+    return tuple(columns)
+
+
+def source_row_metadata(note, speaker, number, include_deprecated):
+    """Share source eligibility between matching and structural discovery."""
+    if note is not None and note.data_type == "f":
+        raise ValueError(f"第 {number} 行特殊说明含公式，无法判断上下文规则，请先转成文本值")
+    note_text = normalize(str(note.value)) if note is not None and note.value is not None else ""
+    if not include_deprecated and note_text == "废弃":
+        return note_text, "", "废弃"
+    if note is not None and not note_text and speaker is not None and speaker.data_type == "f":
+        raise ValueError(f"第 {number} 行说话角色名含公式，无法判断是否为无效信息，请先转成文本值")
+    speaker_text = normalize(str(speaker.value)) if speaker is not None and speaker.value is not None else ""
+    invalid = note is not None and speaker is not None and not note_text and not speaker_text
+    return note_text, speaker_text, "无效说明" if invalid else ""
+
+
+def breath_key(value):
+    """Remove balanced Chinese/ASCII parenthetical directions only for breath lines."""
+    text = match_key(value)
+    stack, result = [], []
+    pairs = {"(": ")", "（": "）"}
+    for char in text:
+        if char in pairs:
+            stack.append(pairs[char])
+        elif char in (")", "）"):
+            if not stack or stack.pop() != char:
+                return text  # Incomplete or mixed-up brackets need manual review.
+        elif not stack:
+            result.append(char)
+    return text if stack else "".join(result).strip()
 
 
 def boundary_newlines(value):
@@ -82,7 +124,7 @@ class MatchReport:
     baseline_files: int = 0
 
 
-def baseline_sheets(workbook, path, header_rows):
+def baseline_sheets(workbook, path, header_rows, *, for_output=True):
     for sheet in workbook:
         if hasattr(sheet, "reset_dimensions"):
             sheet.reset_dimensions()
@@ -99,10 +141,10 @@ def baseline_sheets(workbook, path, header_rows):
             positions = "、".join(f"{get_column_letter(column)}{row}" for row, column, _ in candidates)
             raise ValueError(f"基准表头不明确：{location} 找到多个 Text：{positions}，请保留唯一的 Text 表头")
         header_row, text_column, headers = candidates[0]
-        if "匹配中文1" in headers.values() or "推荐状态" in headers.values():
+        if for_output and ("匹配中文1" in headers.values() or "推荐状态" in headers.values()):
             raise ValueError(f"{location} 已有检索结果，请提供未回填的基准文件")
         output_column = max(18, max(headers) + 1)
-        if output_column + 15 > 16384:
+        if for_output and output_column + 15 > 16384:
             raise ValueError(f"{location} 的表头右侧不足 16 列，无法写入检索结果")
         yield sheet, header_row, text_column, output_column
 
@@ -323,42 +365,89 @@ def write_detail_sheet(book, title, headers, rows, widths, progress=None, row_li
     return total
 
 
-def read_context(connection, table, path, sheet, sequence, plain=False):
-    if plain:
-        # Partial sequence indexes skip tag-only rows before taking three neighbors.
-        return tuple(list(connection.execute(f"""
-            SELECT row,plain_text FROM {table} WHERE path=? AND sheet=? AND seq {operator} ?
-            AND plain_text!='' ORDER BY seq {order} LIMIT 3
-        """, (path, sheet, sequence))) for operator, order in (("<", "DESC"), (">", "ASC")))
-    # Table names are fixed by the two callers. Only six nearby records are read.
-    records = list(connection.execute(f"""
-        SELECT seq,row,text FROM {table} WHERE path=? AND sheet=? AND seq BETWEEN ? AND ? ORDER BY seq
-    """, (path, sheet, sequence - 3, sequence + 3)))
-    previous = [[row, text] for seq, row, text in reversed(records) if seq < sequence]
-    following = [[row, text] for seq, row, text in records if seq > sequence]
-    return previous, following
+def read_context(connection, table, path, sheet, sequence, plain=False, limit=3):
+    """Source windows extend until three usable lines, retaining skipped evidence."""
+    column = "plain_text" if plain else "text"
+    source = table == "source_context_rows"
+    expression = (f"CASE WHEN context_skip='气息' THEN {'breath_plain' if plain else 'breath_text'} "
+                  f"ELSE {column} END") if source else column
+    nonempty = f"({column}!='' OR context_skip!='')" if source else f"{column}!=''"
+    result = []
+    for operator, order in (("<", "DESC"), (">", "ASC")):
+        cursor = connection.execute(f"""
+            SELECT row,{expression}{',context_skip' if source else ''} FROM {table}
+            WHERE path=? AND sheet=? AND seq {operator} ?
+            AND {nonempty}
+            ORDER BY seq {order} {'' if source else 'LIMIT ?'}
+        """, (path, sheet, sequence) if source else (path, sheet, sequence, limit))
+        records, usable = [], 0
+        for record in cursor:
+            records.append(list(record))
+            usable += not source or not record[2]
+            if usable >= limit:
+                break
+        result.append(records)
+    return tuple(result)
+
+
+def align_context(connection, path, sheet, sequence, baseline, source, plain=False):
+    """Consume an ignored line on the baseline side only when its text also matches."""
+    limit = max(3, *(len(side) for side in source))
+    if limit > 3:
+        baseline = read_context(connection, "baseline_rows", path, sheet, sequence, plain, limit)
+    used_baseline, used_source, skipped = [], [], []
+    for direction, base, raw_source in zip(("前", "后"), baseline, source):
+        base_index, bp, sp = 0, [], []
+        for row, text, note in raw_source:
+            if note:
+                base_text = base[base_index][1] if base_index < len(base) else ""
+                if note == "气息":
+                    base_text = breath_key(base_text)
+                if base_index < len(base) and text == base_text:
+                    position = f"同时越过基准行{base[base_index][0]}"
+                    base_index += 1
+                else:
+                    position = "基准邻句无同文，仅越过台本行"
+                skipped.append(f"{direction}：源行{row}（{note}）；{position}")
+                continue
+            sp.append([row, text])
+            if base_index < len(base):
+                bp.append(base[base_index])
+                base_index += 1
+        bp.extend(base[base_index:base_index + 3 - len(bp)])
+        used_baseline.append(bp)
+        used_source.append(sp)
+    return *used_baseline, *used_source, "\n".join(skipped)
 
 
 def context_text(records, direction):
     return "\n".join(f"{direction}{index}句 [行{row}] {text}" for index, (row, text) in enumerate(records, 1))
 
 
+def context_statistics(source, previous_equal, following_equal):
+    counts = [(len(side), sum(r[2] == "演出" for r in side), sum(r[2] == "气息" for r in side), equal)
+              for side, equal in zip(source, (previous_equal, following_equal))]
+    totals = tuple(sum(values) for values in zip(*counts))
+    return "\n".join(f"{label}：查询{n}行，演出{stage}行，气息{breath}行，匹配{equal}句"
+                     for label, (n, stage, breath, equal) in
+                     zip(("向上", "向下", "合计（不含当前句）"), [*counts, totals]))
+
+
 def build_recommendations(connection, progress=None):
     """Compare each baseline occurrence against its candidates; keep evidence on disk."""
     connection.executescript("""
         CREATE TABLE source_context (source_id INTEGER PRIMARY KEY, previous TEXT, following TEXT,plain_previous TEXT,plain_following TEXT);
-        CREATE TABLE baseline_context (path TEXT,sheet TEXT,row INTEGER,previous TEXT,following TEXT,plain_previous TEXT,plain_following TEXT,
-            PRIMARY KEY(path,sheet,row));
         CREATE TABLE comparisons (path TEXT,sheet TEXT,row INTEGER,source_id INTEGER,
             previous_equal INTEGER,following_equal INTEGER,full_sides INTEGER,match_type TEXT,
+            baseline_previous TEXT,baseline_following TEXT,source_previous TEXT,source_following TEXT,skipped TEXT,query_statistics TEXT,
             PRIMARY KEY(path,sheet,row,source_id));
         CREATE INDEX comparison_source ON comparisons(source_id);
         CREATE TABLE recommendations (path TEXT,sheet TEXT,row INTEGER,source_id INTEGER,basis TEXT,status TEXT,match_type TEXT,
             PRIMARY KEY(path,sheet,row));
         CREATE INDEX recommendation_source ON recommendations(source_id);
     """)
-    for source_id, path, sheet, sequence in connection.execute("SELECT rowid,path,sheet,seq FROM hits"):
-        previous, following = read_context(connection, "source_rows", path, sheet, sequence)
+    for source_id, path, sheet, sequence in connection.execute("SELECT DISTINCT rowid,path,sheet,seq FROM hits"):
+        previous, following = read_context(connection, "source_context_rows", path, sheet, sequence)
         connection.execute("INSERT INTO source_context (source_id,previous,following) VALUES (?,?,?)",
                            (source_id, json.dumps(previous, ensure_ascii=False), json.dumps(following, ensure_ascii=False)))
     for plain in (False, True):
@@ -370,43 +459,47 @@ def build_recommendations(connection, progress=None):
         records = connection.execute(f"SELECT b.path,b.sheet,b.row,b.{column},b.seq FROM baseline_rows b {condition} ORDER BY b.path,b.sheet,b.row")
         for index, (path, sheet, row, text, sequence) in enumerate(records, 1):
             match_type = "纯文本补匹配" if plain else "全文精确匹配"
-            previous, following = read_context(connection, "baseline_rows", path, sheet, sequence)
-            connection.execute("INSERT OR IGNORE INTO baseline_context (path,sheet,row,previous,following) VALUES (?,?,?,?,?)",
-                               (path, sheet, row, json.dumps(previous, ensure_ascii=False), json.dumps(following, ensure_ascii=False)))
+            previous, following = read_context(connection, "baseline_rows", path, sheet, sequence, plain)
+            breath_text = breath_key(text)
             if plain:
-                previous, following = read_context(connection, "baseline_rows", path, sheet, sequence, plain=True)
-                connection.execute("UPDATE baseline_context SET plain_previous=?,plain_following=? WHERE path=? AND sheet=? AND row=?",
-                                   (json.dumps(previous, ensure_ascii=False), json.dumps(following, ensure_ascii=False), path, sheet, row))
                 count = connection.execute("""SELECT COUNT(*),SUM(korean_key=''),
                     COUNT(DISTINCT CASE WHEN korean_key!='' THEN korean_key END)
-                    FROM source_rows WHERE plain_text=?""", (text,)).fetchone()
+                    FROM source_rows WHERE plain_text=? OR (breath_plain!='' AND breath_plain=?)""", (text, breath_text)).fetchone()
             else:
                 count = connection.execute("SELECT n,missing,variants FROM counts WHERE text=?", (text,)).fetchone()
             best_score, best_id, best_key, tied = (-1, -1), None, None, False
             best_previous = best_following = 0
             column = "plain_text" if plain else "text"
+            breath_column = "breath_plain" if plain else "breath_text"
             candidates = connection.execute(f"""
-                SELECT rowid,korean_key,path,sheet,seq FROM source_rows WHERE {column}=? ORDER BY rowid
-            """, (text,))
-            for source_id, korean_key, source_path, source_sheet, source_sequence in candidates:
+                SELECT rowid,korean_key,path,sheet,seq,{column} FROM source_rows
+                WHERE {column}=? OR ({breath_column}!='' AND {breath_column}=?) ORDER BY rowid
+            """, (text, breath_text))
+            for source_id, korean_key, source_path, source_sheet, source_sequence, source_text in candidates:
+                candidate_type = "气息去括号匹配" if not plain and source_text != text else match_type
                 context = connection.execute("SELECT previous,following FROM source_context WHERE source_id=?", (source_id,)).fetchone()
                 if context is None:
-                    sp, sf = read_context(connection, "source_rows", source_path, source_sheet, source_sequence)
+                    sp, sf = read_context(connection, "source_context_rows", source_path, source_sheet, source_sequence)
                     connection.execute("INSERT INTO source_context (source_id,previous,following) VALUES (?,?,?)", (source_id, json.dumps(sp, ensure_ascii=False), json.dumps(sf, ensure_ascii=False)))
                 else:
                     sp, sf = map(json.loads, context)
                 if plain:
                     context = connection.execute("SELECT plain_previous,plain_following FROM source_context WHERE source_id=?", (source_id,)).fetchone()
                     if context[0] is None:
-                        sp, sf = read_context(connection, "source_rows", source_path, source_sheet, source_sequence, plain=True)
+                        sp, sf = read_context(connection, "source_context_rows", source_path, source_sheet, source_sequence, plain=True)
                         connection.execute("UPDATE source_context SET plain_previous=?,plain_following=? WHERE source_id=?",
                                            (json.dumps(sp, ensure_ascii=False), json.dumps(sf, ensure_ascii=False), source_id))
                     else:
                         sp, sf = map(json.loads, context)
-                pe = sum(a[1] == b[1] for a, b in zip(previous, sp))
-                fe = sum(a[1] == b[1] for a, b in zip(following, sf))
-                full = int(len(previous) == len(sp) == pe == 3) + int(len(following) == len(sf) == fe == 3)
-                connection.execute("INSERT OR REPLACE INTO comparisons VALUES (?,?,?,?,?,?,?,?)", (path, sheet, row, source_id, pe, fe, full, match_type))
+                bp, bf, used_sp, used_sf, skipped = align_context(
+                    connection, path, sheet, sequence, (previous, following), (sp, sf), plain)
+                pe = sum(a[1] == b[1] for a, b in zip(bp, used_sp))
+                fe = sum(a[1] == b[1] for a, b in zip(bf, used_sf))
+                full = int(len(bp) == len(used_sp) == pe == 3) + int(len(bf) == len(used_sf) == fe == 3)
+                connection.execute("INSERT OR REPLACE INTO comparisons VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (path, sheet, row, source_id, pe, fe, full, candidate_type,
+                     *(json.dumps(items, ensure_ascii=False) for items in (bp, bf, used_sp, used_sf)), skipped,
+                     context_statistics((sp, sf), pe, fe)))
                 if not korean_key:
                     continue
                 score = (full, pe + fe)
@@ -428,6 +521,13 @@ def build_recommendations(connection, progress=None):
             else:
                 status = "上下文推荐"
                 basis = f"前{best_previous}/3句一致，后{best_following}/3句一致；完整一致侧数{best_score[0]}，一致位置数{best_score[1]}"
+            if best_id is not None:
+                basis += "；完美匹配：上下各3句有效台词一致" if best_score[0] == 2 else "；非完美匹配：上下未同时各满足3句"
+                breath = connection.execute(f"SELECT {column},{breath_column} FROM source_rows WHERE rowid=?", (best_id,)).fetchone()
+                if breath[1] and breath[1] == breath_text and breath[0] != text:
+                    basis += "；气息台词忽略括号说明（原文保留）"
+                    if not plain:
+                        match_type = "气息去括号匹配"
             if plain:
                 basis = (PLAIN_REVIEW_NOTE + "；" if best_id is not None else "纯文本补匹配未能推荐；") + basis
             connection.execute("INSERT OR REPLACE INTO recommendations VALUES (?,?,?,?,?,?,?)", (path, sheet, row, best_id, basis, status, match_type))
@@ -490,29 +590,31 @@ def write_matching_details(destination, connection, progress=None):
         SELECT b.path,b.sheet,b.row,s.path,s.sheet,s.row,s.chinese,s.korean,
                CASE WHEN s.korean_key='' THEN '是' ELSE '否' END,
                CASE WHEN c.variants>1 THEN '是' ELSE '否' END,
-               CASE WHEN e.match_type='纯文本补匹配' THEN bc.plain_previous ELSE bc.previous END,
-               CASE WHEN e.match_type='纯文本补匹配' THEN bc.plain_following ELSE bc.following END,
-               CASE WHEN e.match_type='纯文本补匹配' THEN sc.plain_previous ELSE sc.previous END,
-               CASE WHEN e.match_type='纯文本补匹配' THEN sc.plain_following ELSE sc.following END,
+               e.baseline_previous,e.baseline_following,e.source_previous,e.source_following,
                e.previous_equal,e.following_equal,e.full_sides,
-               CASE WHEN r.source_id=s.rowid THEN '是' ELSE '否' END,r.status,r.basis,e.match_type
+               CASE WHEN r.source_id=s.rowid THEN '是' ELSE '否' END,r.status,r.basis,e.match_type,e.skipped,e.query_statistics
         FROM comparisons e JOIN source_rows s ON s.rowid=e.source_id
         JOIN baseline_rows b ON b.path=e.path AND b.sheet=e.sheet AND b.row=e.row
         JOIN baseline_counts c ON c.path=b.path AND c.sheet=b.sheet AND c.row=b.row
-        JOIN baseline_context bc ON bc.path=b.path AND bc.sheet=b.sheet AND bc.row=b.row
-        JOIN source_context sc ON sc.source_id=s.rowid
         JOIN recommendations r ON r.path=b.path AND r.sheet=b.sheet AND r.row=b.row
         ORDER BY s.rowid,b.path,b.sheet,b.row
     """)
     rows = ([Path(b).name,b,bs,br,Path(p).name,p,ss,sr,cn,ko,missing,conflict,
              context_text(json.loads(bp), "前"),context_text(json.loads(bf), "后"),
              context_text(json.loads(sp), "前"),context_text(json.loads(sf), "后"),
-             pe,fe,full,pe+fe,selected,status,basis,match_type]
-            for b,bs,br,p,ss,sr,cn,ko,missing,conflict,bp,bf,sp,sf,pe,fe,full,selected,status,basis,match_type in matches)
+             pe,fe,full,pe+fe,selected,status,basis,match_type,
+             "是" if full == 2 else "否",
+             skipped if len(skipped) <= 32000 else skipped[:32000] + "\n（展示截断，完整特殊行见上下文排除明细）", statistics]
+            for b,bs,br,p,ss,sr,cn,ko,missing,conflict,bp,bf,sp,sf,pe,fe,full,selected,status,basis,match_type,skipped,statistics in matches)
     pairs = write_detail_sheet(book, "匹配明细",
                                ["基准文件名","基准完整路径","基准 Sheet","基准行号","源文件名","源完整路径","源 Sheet","源行号","源中文","韩语","缺译","译文冲突",
-                                "基准前3句","基准后3句","来源前3句","来源后3句","前句一致数","后句一致数","完整一致侧数","一致位置总数","推荐来源","推荐状态","推荐依据","匹配方式"],
-                               rows, [30,65,25,16,35,65,25,16,55,55,12,16,65,65,65,65,18,18,20,20,16,24,70,24], progress)
+                                "基准前3句","基准后3句","来源前3句","来源后3句","前句一致数","后句一致数","完整一致侧数","一致位置总数","推荐来源","推荐状态","推荐依据","匹配方式",
+                                "完美匹配","上下文跳过位置","上下文查询统计"],
+                               rows, [30,65,25,16,35,65,25,16,55,55,12,16,65,65,65,65,18,18,20,20,16,24,70,24,16,75,75], progress)
+    write_detail_sheet(book, "上下文排除明细",
+        ["源完整路径", "源Sheet", "源行号", "源中文", "源韩文", "特殊说明", "说话角色名", "处理"],
+        connection.execute("SELECT * FROM context_exclusions ORDER BY path,sheet,row"),
+        [65, 25, 16, 70, 70, 20, 25, 75], progress)
     for title, condition in (("未匹配明细", "t.source_id IS NULL"), ("缺译明细", "s.korean_key=''"), ("译文冲突", "c.text IS NOT NULL")):
         # Conditions are fixed program constants, never user input.
         records = connection.execute(f"""
@@ -583,7 +685,8 @@ def write_statistics(destination, file_rows, sheet_rows, skipped):
     book.close()
 
 
-def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress=None):
+def prepare_inputs(report, baseline_root, output_root, ignored_sheets=(), progress=None):
+    """Validate roots and recheck sheets for both matching and structure scans."""
     baseline_root = Path(baseline_root).expanduser().resolve()
     output_root = Path(output_root).expanduser().resolve()
     source_root = report.root.resolve()
@@ -637,6 +740,12 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                 pass  # File-level read errors already appear in the header report.
     if not candidates:
         raise ValueError("没有可参与匹配的 Sheet；请先检查表头并处理异常或调整忽略记录")
+    return fresh, candidates, skipped, baselines, baseline_root, output_root
+
+
+def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress=None):
+    fresh, candidates, skipped, baselines, baseline_root, output_root = prepare_inputs(
+        report, baseline_root, output_root, ignored_sheets, progress)
     output_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="匹配临时_", dir=output_root) as temporary:
         staging = Path(temporary)
@@ -645,19 +754,29 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
         sheet_rows = []
         try:
             connection.executescript("""
-                CREATE TABLE targets (text TEXT PRIMARY KEY);
+                CREATE TABLE targets (text TEXT PRIMARY KEY,breath_text TEXT);
+                CREATE INDEX target_breath ON targets(breath_text);
                 CREATE TABLE baseline_rows (path TEXT, sheet TEXT, row INTEGER, text TEXT, seq INTEGER,
                     leading_newline INTEGER,trailing_newline INTEGER,plain_text TEXT,PRIMARY KEY (path, sheet, row));
                 CREATE INDEX baseline_text ON baseline_rows(text);
                 CREATE UNIQUE INDEX baseline_sequence ON baseline_rows(path,sheet,seq);
-                CREATE TABLE source_rows (text TEXT, chinese TEXT, korean TEXT, path TEXT, sheet TEXT, row INTEGER, korean_key TEXT, seq INTEGER,plain_text TEXT);
+                CREATE TABLE source_rows (text TEXT, chinese TEXT, korean TEXT, path TEXT, sheet TEXT, row INTEGER,
+                    korean_key TEXT, seq INTEGER,plain_text TEXT,breath_text TEXT,breath_plain TEXT);
                 CREATE INDEX source_text ON source_rows(text);
                 CREATE INDEX source_position ON source_rows(path,sheet);
                 CREATE UNIQUE INDEX source_sequence ON source_rows(path,sheet,seq);
                 CREATE INDEX source_plain ON source_rows(plain_text);
-                CREATE INDEX source_plain_sequence ON source_rows(path,sheet,seq) WHERE plain_text!='';
+                CREATE INDEX source_breath ON source_rows(breath_text);
+                CREATE INDEX source_breath_plain ON source_rows(breath_plain);
+                CREATE TABLE source_context_rows (
+                    path TEXT,sheet TEXT,row INTEGER,seq INTEGER,text TEXT,plain_text TEXT,
+                    context_skip TEXT,breath_text TEXT,breath_plain TEXT);
+                CREATE UNIQUE INDEX context_sequence ON source_context_rows(path,sheet,seq);
                 CREATE INDEX baseline_plain_sequence ON baseline_rows(path,sheet,seq) WHERE plain_text!='';
-                CREATE VIEW hits AS SELECT s.rowid AS rowid,s.* FROM source_rows s JOIN targets t ON t.text=s.text;
+                CREATE VIEW hits AS SELECT s.rowid AS rowid,s.*,t.text AS target_text FROM source_rows s
+                    JOIN targets t ON t.text=s.text OR (s.breath_text!='' AND t.breath_text=s.breath_text);
+                CREATE TABLE context_exclusions (
+                    path TEXT,sheet TEXT,row INTEGER,chinese TEXT,korean TEXT,note TEXT,speaker TEXT,reason TEXT);
             """)
             baseline_parts = {}
             for path in baselines:
@@ -676,7 +795,7 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                             if key:
                                 baseline_rows += 1
                                 sequence += 1
-                                connection.execute("INSERT OR IGNORE INTO targets VALUES (?)", (key,))
+                                connection.execute("INSERT OR IGNORE INTO targets VALUES (?,?)", (key, breath_key(key)))
                                 connection.execute("INSERT INTO baseline_rows VALUES (?,?,?,?,?,?,?,?)",
                                                    (str(path), sheet.title, cell.row, key, sequence, *boundary_newlines(cell.value), plain_key(cell.value)))
                 finally:
@@ -696,10 +815,12 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                             sheet = book[result.sheet]
                             sheet.reset_dimensions()
                             hidden_rows = hidden_row_numbers(book, sheet) if not report.include_hidden_rows else set()
-                            total = matched = 0
+                            total = matched = sequence = 0
                             columns = [result.chinese_column, result.korean_column]
-                            if not report.include_deprecated and result.notes_column:
-                                columns.append(result.notes_column)
+                            header = next(sheet.iter_rows(min_row=result.header_row, max_row=result.header_row))
+                            metadata_columns = source_metadata_columns(header)
+                            notes_column, speaker_column = metadata_columns
+                            columns.extend(c for c in metadata_columns if c)
                             first, last = min(columns), max(columns)
                             for number, row in enumerate(sheet.iter_rows(min_row=result.header_row + 1,
                                                                         min_col=first, max_col=last), result.header_row + 1):
@@ -707,22 +828,42 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                                 korean = row[result.korean_column - first]
                                 if number in hidden_rows:
                                     continue
-                                if not report.include_deprecated and result.notes_column:
-                                    note = row[result.notes_column - first]
-                                    if note.data_type == "f":
-                                        raise ValueError(f"第 {number} 行特殊说明含公式，无法判断废弃标记，请先转成文本值")
-                                    if normalize(note.value) == "废弃":
-                                        continue
+                                note = row[notes_column - first] if notes_column else None
+                                speaker = row[speaker_column - first] if speaker_column else None
+                                note_text, speaker_text, excluded = source_row_metadata(
+                                    note, speaker, number, report.include_deprecated)
+                                if excluded == "废弃":
+                                    continue
+                                invalid = excluded == "无效说明"
+                                if (invalid and match_key(chinese.value)) or note_text in CONTEXT_SKIP_NOTES:
+                                    connection.execute("INSERT INTO context_exclusions VALUES (?,?,?,?,?,?,?,?)",
+                                        (str(path), sheet.title, number, chinese.value,
+                                         None if korean.value is None else str(korean.value), note_text, speaker_text,
+                                         "两列均为空：从匹配与上下文排除" if invalid else
+                                         "上下文不计有效句，继续向外补查；有正文时仍参与整句匹配" +
+                                         ("；比较时忽略成对括号说明" if note_text == "气息" else "")))
+                                if invalid:
+                                    continue
                                 if chinese.data_type == "f" or korean.data_type == "f":
                                     raise ValueError(f"第 {number} 行中韩文本含公式，请先转成文本值")
                                 key = match_key(chinese.value)
+                                context_skip = note_text if note_text in CONTEXT_SKIP_NOTES else ""
+                                breath = breath_key(chinese.value) if note_text == "气息" else ""
+                                if key or context_skip:
+                                    sequence += 1
+                                    connection.execute("INSERT INTO source_context_rows VALUES (?,?,?,?,?,?,?,?,?)",
+                                        (str(path), sheet.title, number, sequence, key, plain_key(chinese.value),
+                                         context_skip, breath, plain_key(breath)))
                                 if not key:
                                     continue
                                 total += 1
                                 translation = None if korean.value is None else str(korean.value)
-                                connection.execute("INSERT INTO source_rows VALUES (?,?,?,?,?,?,?,?,?)",
-                                                   (key, chinese.value, translation, str(path), sheet.title, number, match_key(translation), total, plain_key(chinese.value)))
-                                if connection.execute("SELECT 1 FROM targets WHERE text=?", (key,)).fetchone():
+                                connection.execute("INSERT INTO source_rows VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                                                   (key, chinese.value, translation, str(path), sheet.title, number,
+                                                    match_key(translation), sequence, plain_key(chinese.value),
+                                                    breath, plain_key(breath)))
+                                if connection.execute("SELECT 1 FROM targets WHERE text=? OR (?!='' AND breath_text=?)",
+                                                      (key, breath, breath)).fetchone():
                                     matched += 1
                             connection.execute("RELEASE sheet")
                             sheet_rows.append([path.name, str(path), result.sheet, total, matched, total - matched,
@@ -748,8 +889,8 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                 failures = [f"{r.path.name} / {r.sheet}：{r.issue}" for results in candidates.values() for r in results if r.issue]
                 raise ValueError("所有候选 Sheet 正文读取失败，未生成匹配结果：\n" + "\n".join(failures[:10]))
             connection.executescript("""
-                CREATE TABLE counts AS SELECT text, COUNT(*) AS n,SUM(korean_key='') AS missing,
-                    COUNT(DISTINCT CASE WHEN korean_key!='' THEN korean_key END) AS variants FROM hits GROUP BY text;
+                CREATE TABLE counts AS SELECT target_text AS text, COUNT(*) AS n,SUM(korean_key='') AS missing,
+                    COUNT(DISTINCT CASE WHEN korean_key!='' THEN korean_key END) AS variants FROM hits GROUP BY target_text;
                 CREATE UNIQUE INDEX count_text ON counts(text);
                 CREATE TABLE conflicts AS SELECT text,COUNT(DISTINCT korean_key) AS variants FROM source_rows
                     WHERE korean_key!='' GROUP BY text HAVING COUNT(DISTINCT korean_key)>1;

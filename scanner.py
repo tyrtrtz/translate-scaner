@@ -34,6 +34,7 @@ class CheckResult:
     details: str = ""
     chinese_column: int | None = None
     korean_column: int | None = None
+    notes_column: int | None = None
 
     @property
     def passed(self):
@@ -52,6 +53,7 @@ class ScanReport:
     recursive: bool = True
     include_hidden_sheets: bool = True
     include_hidden_rows: bool = True
+    include_deprecated: bool = False
     skipped_sheets: list[CheckResult] = field(default_factory=list)
     file_paths: list[Path] = field(default_factory=list)
 
@@ -89,8 +91,9 @@ def hidden_row_numbers(workbook, sheet, max_row=None):
     return hidden
 
 
-def check_sheet(path, sheet, header_rows, chinese_headers, korean_headers, hidden_rows=()):
+def check_sheet(path, sheet, header_rows, chinese_headers, korean_headers, hidden_rows=(), include_deprecated=False):
     chinese, korean = [], []
+    notes = []
     top_rows, candidate_rows = {}, {}
     # Ignore unreliable Excel dimension metadata; the explicit row limit still
     # bounds iteration. Visibility exclusions are determined separately.
@@ -103,6 +106,8 @@ def check_sheet(path, sheet, header_rows, chinese_headers, korean_headers, hidde
         row_number = None
         for cell in row:
             text = normalize(cell.value)
+            if text == "特殊说明":
+                notes.append((cell.row, cell.coordinate, str(cell.value)))
             if cell.value is not None and str(cell.value).strip():
                 row_number = cell.row
                 if len(preview) < 32:
@@ -144,6 +149,9 @@ def check_sheet(path, sheet, header_rows, chinese_headers, korean_headers, hidde
             problems.append(f"第 {selected_row} 行存在多个韩语候选列：{describe([hit for hit in korean if hit[0] == selected_row])}")
         if {hit[1] for hit in chinese} & {hit[1] for hit in korean}:
             problems.append("中文列与韩语列重合")
+    selected_notes = [hit for hit in notes if hit[0] == selected_row]
+    if not include_deprecated and len(selected_notes) > 1:
+        problems.append(f"第 {selected_row} 行存在多个特殊说明列：{describe(selected_notes)}，无法确定废弃标记")
 
     sample_rows = {**top_rows, **candidate_rows}
     details = "\n".join([
@@ -163,6 +171,7 @@ def check_sheet(path, sheet, header_rows, chinese_headers, korean_headers, hidde
         "；".join(problems), describe(chinese), describe(korean), selected_row, details,
         next((cell_column(coordinate) for number, coordinate, _ in chinese if number == selected_row), None),
         next((cell_column(coordinate) for number, coordinate, _ in korean if number == selected_row), None),
+        cell_column(selected_notes[0][1]) if len(selected_notes) == 1 else None,
     )
 
 
@@ -173,7 +182,7 @@ def cell_column(coordinate):
 
 def scan_folder(root, header_rows=10, chinese_headers=CHINESE_HEADERS,
                 korean_headers=KOREAN_HEADERS, progress=None, ignored_sheets=(),
-                recursive=True, include_hidden_sheets=True, include_hidden_rows=True):
+                recursive=True, include_hidden_sheets=True, include_hidden_rows=True, include_deprecated=False):
     root = Path(root).expanduser().resolve()
     if not root.is_dir():
         raise ValueError("请选择存在的源文件夹")
@@ -199,6 +208,7 @@ def scan_folder(root, header_rows=10, chinese_headers=CHINESE_HEADERS,
     report.recursive = recursive
     report.include_hidden_sheets = include_hidden_sheets
     report.include_hidden_rows = include_hidden_rows
+    report.include_deprecated = include_deprecated
     report.file_paths = files
     ignored_sheets = set(ignored_sheets)
     for index, path in enumerate(files, 1):
@@ -221,7 +231,7 @@ def scan_folder(root, header_rows=10, chinese_headers=CHINESE_HEADERS,
                     continue
                 try:
                     hidden_rows = hidden_row_numbers(workbook, sheet, header_rows) if not include_hidden_rows else set()
-                    report.results.append(check_sheet(path, sheet, header_rows, chinese_headers, korean_headers, hidden_rows))
+                    report.results.append(check_sheet(path, sheet, header_rows, chinese_headers, korean_headers, hidden_rows, include_deprecated))
                 except Exception as error:
                     report.results.append(CheckResult(path, sheet.title, issue=f"工作表读取失败：{type(error).__name__}: {error}"))
         except Exception as error:
@@ -271,11 +281,12 @@ if __name__ == "__main__":
     parser.add_argument("--no-recursive", action="store_true")
     parser.add_argument("--no-hidden-sheets", action="store_true")
     parser.add_argument("--no-hidden-rows", action="store_true")
+    parser.add_argument("--include-deprecated", action="store_true")
     args = parser.parse_args()
     try:
         report = scan_folder(args.folder, args.rows, ignored_sheets=load_ignored(),
                              recursive=not args.no_recursive, include_hidden_sheets=not args.no_hidden_sheets,
-                             include_hidden_rows=not args.no_hidden_rows)
+                             include_hidden_rows=not args.no_hidden_rows, include_deprecated=args.include_deprecated)
         export_exceptions(report, args.output)
     except (ValueError, OSError) as error:
         parser.exit(1, f"检查失败：{error}\n")

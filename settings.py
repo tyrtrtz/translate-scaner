@@ -10,7 +10,7 @@ from scanner import CHINESE_HEADERS, KOREAN_HEADERS, normalize
 def default_settings():
     return dict(version=1, source_folder="", baseline_folder="", output_folder="", rows=10,
                 chinese_headers=list(CHINESE_HEADERS), korean_headers=list(KOREAN_HEADERS),
-                recursive=True, include_hidden_sheets=True, include_hidden_rows=True)
+                recursive=True, include_hidden_sheets=True, include_hidden_rows=True, include_deprecated=False)
 
 
 def validate_settings(data):
@@ -23,7 +23,7 @@ def validate_settings(data):
             raise ValueError("文件夹设置必须是文本")
     if type(result["rows"]) is not int or result["rows"] < 1:
         raise ValueError("检查行数必须是大于等于 1 的整数")
-    for key in ("recursive", "include_hidden_sheets", "include_hidden_rows"):
+    for key in ("recursive", "include_hidden_sheets", "include_hidden_rows", "include_deprecated"):
         if type(result[key]) is not bool:
             raise ValueError("扫描开关设置必须为布尔值")
     for key in ("chinese_headers", "korean_headers"):

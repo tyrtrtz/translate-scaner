@@ -383,18 +383,19 @@ class Application:
         self.recursive = tk.BooleanVar(value=preferences["recursive"])
         self.include_hidden_sheets = tk.BooleanVar(value=preferences["include_hidden_sheets"])
         self.include_hidden_rows = tk.BooleanVar(value=preferences["include_hidden_rows"])
+        self.include_deprecated = tk.BooleanVar(value=preferences["include_deprecated"])
         self.scan_switches = []
         for row, (title, variable) in enumerate((("包含子文件夹", self.recursive), ("包含隐藏工作表", self.include_hidden_sheets),
-                                                ("包含隐藏行", self.include_hidden_rows)), 10):
+                                                ("包含隐藏行", self.include_hidden_rows), ("包含废弃行", self.include_deprecated)), 10):
             switch = ttk.Checkbutton(sidebar, text=title, variable=variable)
             switch.grid(row=row, column=0, sticky="w")
             self.scan_switches.append(switch)
-        sidebar.rowconfigure(13, weight=1)
-        ttk.Separator(sidebar).grid(row=14, column=0, sticky="ew", pady=(8, 8))
+        sidebar.rowconfigure(14, weight=1)
+        ttk.Separator(sidebar).grid(row=15, column=0, sticky="ew", pady=(8, 8))
         self.start_button = ttk.Button(sidebar, text="开始表头检查  →", style="Primary.TButton", command=self.start)
-        self.start_button.grid(row=15, column=0, sticky="ew")
+        self.start_button.grid(row=16, column=0, sticky="ew")
         self.save_settings_button = ttk.Button(sidebar, text="保存当前设置", style="Compact.TButton", command=lambda: self.store_settings(notify=True))
-        self.save_settings_button.grid(row=16, column=0, sticky="ew", pady=(6, 0))
+        self.save_settings_button.grid(row=17, column=0, sticky="ew", pady=(6, 0))
 
         workspace = ttk.Frame(body)
         workspace.grid(row=0, column=1, sticky="nsew")
@@ -690,7 +691,7 @@ class Application:
                                chinese_headers=[v for v in self.chinese.get("1.0", "end").splitlines() if v.strip()],
                                korean_headers=[v for v in self.korean.get("1.0", "end").splitlines() if v.strip()],
                                recursive=self.recursive.get(), include_hidden_sheets=self.include_hidden_sheets.get(),
-                               include_hidden_rows=self.include_hidden_rows.get())
+                               include_hidden_rows=self.include_hidden_rows.get(), include_deprecated=self.include_deprecated.get())
             save_settings(preferences, self.settings_file)
         except (OSError, ValueError) as error:
             messagebox.showerror("设置保存失败", f"{error}\n原有设置已保留。")
@@ -712,9 +713,9 @@ class Application:
             current = (Path(self.folder.get().strip()).expanduser().resolve(), int(self.rows.get()),
                        {normalize(v) for v in self.chinese.get("1.0", "end").splitlines() if normalize(v)},
                        {normalize(v) for v in self.korean.get("1.0", "end").splitlines() if normalize(v)},
-                       self.recursive.get(), self.include_hidden_sheets.get(), self.include_hidden_rows.get())
+                       self.recursive.get(), self.include_hidden_sheets.get(), self.include_hidden_rows.get(), self.include_deprecated.get())
             expected = (self.report.root, self.report.header_rows, set(self.report.chinese_headers), set(self.report.korean_headers),
-                        self.report.recursive, self.report.include_hidden_sheets, self.report.include_hidden_rows)
+                        self.report.recursive, self.report.include_hidden_sheets, self.report.include_hidden_rows, self.report.include_deprecated)
             if current != expected:
                 raise ValueError("源文件夹或检查规则已改变，请先重新执行第一步检查")
             baseline = self.baseline_folder.get().strip()
@@ -781,7 +782,7 @@ class Application:
         self.status.set("正在查找 Excel 文件……")
         ignored = set(self.ignored)
         scan_options = dict(recursive=self.recursive.get(), include_hidden_sheets=self.include_hidden_sheets.get(),
-                            include_hidden_rows=self.include_hidden_rows.get())
+                            include_hidden_rows=self.include_hidden_rows.get(), include_deprecated=self.include_deprecated.get())
         events = self.events
 
         def work():

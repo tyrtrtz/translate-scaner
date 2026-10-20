@@ -545,7 +545,7 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
     fresh = scan_folder(source_root, report.header_rows, report.chinese_headers,
                         report.korean_headers, ignored_sheets=ignored,
                         recursive=report.recursive, include_hidden_sheets=report.include_hidden_sheets,
-                        include_hidden_rows=report.include_hidden_rows,
+                        include_hidden_rows=report.include_hidden_rows, include_deprecated=report.include_deprecated,
                         progress=lambda i, n, p: progress(f"复查表头 {i}/{n}：{p.name}") if progress else None)
     candidates, skipped = {}, []
     for result in fresh.skipped_sheets:
@@ -636,13 +636,22 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                             sheet.reset_dimensions()
                             hidden_rows = hidden_row_numbers(book, sheet) if not report.include_hidden_rows else set()
                             total = matched = 0
-                            first, last = sorted((result.chinese_column, result.korean_column))
+                            columns = [result.chinese_column, result.korean_column]
+                            if not report.include_deprecated and result.notes_column:
+                                columns.append(result.notes_column)
+                            first, last = min(columns), max(columns)
                             for number, row in enumerate(sheet.iter_rows(min_row=result.header_row + 1,
                                                                         min_col=first, max_col=last), result.header_row + 1):
                                 chinese = row[result.chinese_column - first]
                                 korean = row[result.korean_column - first]
                                 if number in hidden_rows:
                                     continue
+                                if not report.include_deprecated and result.notes_column:
+                                    note = row[result.notes_column - first]
+                                    if note.data_type == "f":
+                                        raise ValueError(f"第 {number} 行特殊说明含公式，无法判断废弃标记，请先转成文本值")
+                                    if normalize(note.value) == "废弃":
+                                        continue
                                 if chinese.data_type == "f" or korean.data_type == "f":
                                     raise ValueError(f"第 {number} 行中韩文本含公式，请先转成文本值")
                                 key = match_key(chinese.value)

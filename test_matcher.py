@@ -398,6 +398,60 @@ class TranslationMatches(unittest.TestCase):
         self.assertEqual(stats["文件统计"]["H2"].value, .5)
         stats.close()
 
+    def test_deprecated_rows_are_excluded_from_matching_context_and_details(self):
+        path = self.write_source([['前1','译文'], ['废弃独有','旧译文'], ['前2','译文'],
+                                  ['前3','译文'], ['目标','正确'], ['非废弃说明','仍有效']])
+        book = load_workbook(path)
+        book.active['AZ1'] = ' 特殊说明 '
+        book.active['AZ3'] = ' \n废弃\t '
+        book.active['AZ7'] = '非废弃'
+        book.save(path)
+        book.close()
+        obsolete = self.write_source([['目标','错误']], name='旧.xlsx')
+        book = load_workbook(obsolete)
+        book.active['C1'] = '特殊说明'
+        book.active['C2'] = '废弃'
+        book.save(obsolete)
+        book.close()
+        self.write_baseline(['前1','前2','前3','目标','非废弃说明'])
+        before = {p: hashlib.sha256(p.read_bytes()).digest() for p in (path, obsolete)}
+        for include, expected in ((False, (5,5,0)), (True, (7,6,1))):
+            with self.subTest(include=include):
+                report = scan_folder(self.source, 1, include_deprecated=include)
+                self.assertEqual(report.results[0].notes_column, 52)
+                result = match_folder(report, self.baseline, self.output)
+                self.assertEqual(result.check_report.include_deprecated, include)
+                self.assertEqual((result.source_rows,result.source_matched,result.conflict_texts), expected)
+                book = load_workbook(result.destination / '匹配明细.xlsx')
+                matched = list(book['匹配明细'].values)[1:]
+                target = [r for r in matched if r[8] == '目标']
+                if not include:
+                    self.assertEqual({r[9] for r in target}, {'正确'})
+                    self.assertEqual(target[0][12:14], ('前1句 [行4] 前3\n前2句 [行3] 前2\n前3句 [行2] 前1', '后1句 [行6] 非废弃说明'))
+                    self.assertNotIn('废弃独有', str(list(book['未推荐明细'].values)))
+                    self.assertNotIn('旧.xlsx', str(matched))
+                else:
+                    self.assertEqual({r[9] for r in target}, {'正确','错误'})
+                book.close()
+        self.assertEqual(before, {p: hashlib.sha256(p.read_bytes()).digest() for p in before})
+
+    def test_deprecated_marker_validation_and_formula_rows(self):
+        path = self.write_source([['=1+1','=2+2'], ['有效','번역']])
+        book = load_workbook(path)
+        book.active['C1'] = '特殊说明'
+        book.active['C2'] = '废弃'
+        book.save(path)
+        book.close()
+        self.write_baseline(['有效'])
+        result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
+        self.assertEqual(result.source_rows, 1)
+        book = load_workbook(path)
+        book.active['D1'] = '特殊说明'
+        book.save(path)
+        book.close()
+        self.assertIn('多个特殊说明列', scan_folder(self.source, 1).exceptions[0].issue)
+        self.assertEqual(scan_folder(self.source, 1, include_deprecated=True).passed_sheets, 1)
+
     def test_hidden_header_row_is_not_used_when_disabled(self):
         path = self.write_source([["中文", "번역"]])
         book = load_workbook(path)

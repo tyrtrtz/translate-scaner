@@ -15,19 +15,24 @@ class SavedSettings(unittest.TestCase):
 
     def test_defaults_and_custom_round_trip(self):
         self.assertEqual(load_settings(self.path), default_settings())
+        self.assertFalse(default_settings()['include_deprecated'])
         values = default_settings()
         values.update(source_folder="C:/客户 한국어/源文件", baseline_folder="基准", output_folder="结果",
-                      rows=1, recursive=False, include_hidden_sheets=False, include_hidden_rows=False,
+                      rows=1, recursive=False, include_hidden_sheets=False, include_hidden_rows=False, include_deprecated=True,
                       chinese_headers=["自定义中文"], korean_headers=["번역"])
         save_settings(values, self.path)
         self.assertEqual(load_settings(self.path), values)
         self.assertIn("客户 한국어", self.path.read_text(encoding="utf-8"))
+        old = values.copy()
+        del old['include_deprecated']
+        self.path.write_text(json.dumps(old), encoding='utf-8')
+        self.assertFalse(load_settings(self.path)['include_deprecated'])
 
     def test_invalid_values_never_replace_saved_settings(self):
         values = default_settings()
         save_settings(values, self.path)
         before = self.path.read_bytes()
-        for changes in ({"rows":0}, {"rows":True}, {"recursive":1}, {"chinese_headers":[]},
+        for changes in ({"rows":0}, {"rows":True}, {"recursive":1}, {"include_deprecated":1}, {"chinese_headers":[]},
                         {"korean_headers":["对白文本"]}, {"output_folder":None}, {"version":2}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 save_settings(values | changes, self.path)

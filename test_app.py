@@ -39,6 +39,9 @@ class DesktopWorkflow(unittest.TestCase):
             book.close()
 
             app = Application(root, ignore_file=base / "ignored.json", settings_file=base / "settings.json")
+            self.assertFalse(app.include_deprecated.get())
+            self.assertEqual([switch.cget('text') for switch in app.scan_switches],
+                             ['包含子文件夹', '包含隐藏工作表', '包含隐藏行', '包含废弃行'])
             root.geometry("1060x760")
             root.update()
             with patch("app.check_for_update", return_value=None), patch("app.messagebox.showinfo") as notices:

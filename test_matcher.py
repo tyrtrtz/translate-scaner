@@ -10,7 +10,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
 
 from ignored_sheets import sheet_key
-from matcher import align_boundary_newlines, match_folder, write_detail_sheet
+from matcher import align_boundary_newlines, match_folder, plain_key, write_detail_sheet
 from scanner import scan_folder
 
 
@@ -451,6 +451,114 @@ class TranslationMatches(unittest.TestCase):
         book.close()
         self.assertIn('多个特殊说明列', scan_folder(self.source, 1).exceptions[0].issue)
         self.assertEqual(scan_folder(self.source, 1, include_deprecated=True).passed_sheets, 1)
+
+    def test_plain_tag_fallback_preserves_values_exact_priority_and_statistics(self):
+        first = self.write_source([['这是基准文件的原文','<color=#3266b4>번역</color>'],
+                                   ['{playername}你好\\n世界','이름{playername}\\n원문'],
+                                   ['{playername}<color=red></color>','标签空句'],
+                                   ['价格100，OK','숫자'], ['精确优先','原推荐']])
+        second = self.write_source([['<b>精确优先</b>','其他译文'], ['<b>废弃候选</b>','废弃译文']], name='B.xlsx')
+        book = load_workbook(second)
+        book.active['C1'] = '特殊说明'
+        book.active['C3'] = '废弃'
+        book.save(second)
+        book.close()
+        baseline = self.write_baseline(['<color=#3266b4>这是基准文件的原文</color>', '你好世界',
+                                        '{other}<size=12></size>', '价格101，OK', '精确优先', '废弃候选'])
+        before = {p: hashlib.sha256(p.read_bytes()).digest() for p in (first,second,baseline)}
+        result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
+        self.assertEqual((result.baseline_rows,result.matched_rows,result.recommended_rows,result.source_matched,result.match_pairs), (6,3,3,3,3))
+        book = load_workbook(result.destination / '基准匹配结果/story.xlsx')
+        sheet = book.active
+        for row, ko in ((2,'<color=#3266b4>번역</color>'), (3,'이름{playername}\\n원문')):
+            self.assertEqual(sheet.cell(row,30).value, ko)
+            self.assertIn('仅纯文本匹配，仍需复核标签', sheet.cell(row,32).value)
+            self.assertEqual(sheet.cell(row,27).value, 1)
+        self.assertEqual(sheet['AD6'].value, '原推荐')
+        self.assertNotIn('仅纯文本匹配', sheet['AF6'].value)
+        self.assertEqual((sheet['AA4'].value,sheet['AA5'].value), (0,0))
+        self.assertIsNone(sheet['AD7'].value)
+        book.close()
+        book = load_workbook(result.destination / '匹配明细.xlsx')
+        rows = list(book['匹配明细'].values)
+        self.assertEqual(rows[0][-1], '匹配方式')
+        self.assertEqual({r[8]:r[-1] for r in rows[1:]},
+                         {'这是基准文件的原文':'纯文本补匹配','{playername}你好\\n世界':'纯文本补匹配','精确优先':'全文精确匹配'})
+        unused = list(book['未推荐明细'].values)[1:]
+        self.assertFalse(any(r[4] in ('这是基准文件的原文','{playername}你好\\n世界') for r in unused))
+        self.assertFalse(any('废弃候选' in str(r) for r in unused))
+        book.close()
+        book = load_workbook(result.destination / '基准文件匹配统计.xlsx')
+        self.assertEqual(list(book['文件统计'].values)[1][2:11], (6,3,3,3,3,0,0,0,0))
+        book.close()
+        book = load_workbook(result.destination / '源文件匹配统计.xlsx')
+        self.assertEqual(sum(r[5] for r in list(book['文件统计'].values)[1:]), 3)
+        book.close()
+        self.assertEqual(before, {p: hashlib.sha256(p.read_bytes()).digest() for p in before})
+        self.assertEqual(plain_key('{playername}<color=#3266b4>你好</color>\\n\r\n世界'), '你好世界')
+        self.assertEqual(plain_key('价格100，OK < 200'), '价格100，OK < 200')
+        self.assertEqual(plain_key('{name}<color=red></color>\\n'), '')
+        included = match_folder(scan_folder(self.source, 1, include_deprecated=True), self.baseline, self.output)
+        self.assertEqual((included.matched_rows,included.recommended_rows), (4,4))
+
+    def test_plain_fallback_can_reuse_source_recommended_by_another_baseline(self):
+        self.write_source([['共同句','번역']])
+        self.write_baseline(['共同句'], name='A.xlsx')
+        self.write_baseline(['<color=red>共同句</color>'], name='B.xlsx')
+        result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
+        self.assertEqual((result.baseline_rows,result.matched_rows,result.recommended_rows,result.source_matched,result.match_pairs), (2,2,2,1,2))
+        book = load_workbook(result.destination / '匹配明细.xlsx')
+        rows = list(book['匹配明细'].values)[1:]
+        self.assertTrue(all(r[20]=='是' for r in rows))
+        self.assertEqual({r[0]:r[-1] for r in rows}, {'A.xlsx':'全文精确匹配','B.xlsx':'纯文本补匹配'})
+        self.assertEqual(list(book['未推荐明细'].values)[1:], [])
+        book.close()
+
+    def test_plain_context_resolves_exact_conflict_and_skips_tag_only_neighbors(self):
+        a = ['<b>前1</b>','{name}','<b>前2</b>','<b>前3</b>','争议',
+             '<i>后1</i>','{empty}','<i>后2</i>','<i>后3</i>']
+        self.write_source([[text,'正确' if text=='争议' else '译文'] for text in a], name='A.xlsx')
+        self.write_source([[text,'错误' if text=='争议' else '译文'] for text in
+                           ['别前1','别前2','别前3','争议','别后1','别后2','别后3']], name='B.xlsx')
+        self.write_baseline(['前1','前2','前3','争议','后1','后2','后3'])
+        result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
+        self.assertEqual((result.matched_rows,result.recommended_rows,result.match_pairs), (7,7,8))
+        book = load_workbook(result.destination / '基准匹配结果/story.xlsx')
+        self.assertEqual(book.active['AD5'].value, '正确')
+        self.assertEqual(book.active['AG5'].value, '上下文推荐')
+        self.assertIn('仅纯文本匹配，仍需复核标签', book.active['AF5'].value)
+        self.assertIn('前3/3句一致，后3/3句一致', book.active['AF5'].value)
+        book.close()
+        book = load_workbook(result.destination / '匹配明细.xlsx')
+        chosen = next(r for r in list(book['匹配明细'].values)[1:] if r[8]=='争议' and r[20]=='是')
+        self.assertEqual(chosen[14], '前1句 [行5] 前3\n前2句 [行4] 前2\n前3句 [行2] 前1')
+        self.assertEqual(chosen[15], '后1句 [行7] 后1\n后2句 [行9] 后2\n后3句 [行10] 后3')
+        self.assertEqual(chosen[16:20], (3,3,2,6))
+        self.assertEqual(chosen[-1], '纯文本补匹配')
+        self.assertTrue(any(r[0]=='B.xlsx' and r[4]=='争议' and r[6]=='是' for r in list(book['未推荐明细'].values)[1:]))
+        book.close()
+
+    def test_plain_conflicts_and_empty_translations_still_require_recommendation_rules(self):
+        self.write_source([['<b>争议</b>','갑'], ['<b>缺译</b>',None], ['<b>唯一</b>','译文']])
+        self.write_source([['<i>争议</i>','을']], name='B.xlsx')
+        self.write_baseline(['争议','缺译','唯一'])
+        result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
+        self.assertEqual((result.matched_rows,result.recommended_rows,result.match_pairs), (3,1,4))
+        book = load_workbook(result.destination / '基准匹配结果/story.xlsx')
+        self.assertIsNone(book.active['AD2'].value)
+        self.assertEqual(book.active['AG2'].value, '待确认')
+        self.assertEqual(book.active['AA2'].value, 2)
+        self.assertEqual(book.active['AC2'].value, '是')
+        self.assertEqual(book.active['AG3'].value, '全部缺译')
+        self.assertIsNone(book.active['AD3'].value)
+        self.assertEqual(book.active['AD4'].value, '译文')
+        book.close()
+        book = load_workbook(result.destination / '匹配明细.xlsx')
+        unused = list(book['未推荐明细'].values)[1:]
+        self.assertEqual(len(unused), 3)
+        self.assertTrue(all(r[6]=='是' and r[8]=='基准文件中找到了但不符合推荐规则' for r in unused))
+        self.assertEqual(list(book['未匹配明细'].values)[1:], [])
+        book.close()
 
     def test_hidden_header_row_is_not_used_when_disabled(self):
         path = self.write_source([["中文", "번역"]])

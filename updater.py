@@ -1,21 +1,25 @@
 """Public GitHub releases and the Windows executable replacement helper."""
 
 import hashlib
+from http.client import IncompleteRead
 import json
 import os
 import re
 import shutil
+import ssl
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-VERSION = "1.1.6"
+VERSION = "1.1.7"
 REPOSITORY = "tyrtrtz/translate-scaner"
 ASSET_NAME = "HeaderChecker.exe"
+BACKUP_ROOT = f"https://raw.githubusercontent.com/{REPOSITORY}/updates"
 
 
 def version_numbers(value):
@@ -24,19 +28,33 @@ def version_numbers(value):
     return tuple(map(int, value.removeprefix("v").split(".")))
 
 
-def check_for_update(current=VERSION):
-    request = Request(f"https://github.com/{REPOSITORY}/releases/latest/download/update.json",
-                      headers={"User-Agent": f"HeaderChecker/{VERSION}"})
-    try:
-        with urlopen(request, timeout=10) as response:
-            release = json.loads(response.read(1024 * 1024))
-    except HTTPError as error:
-        if error.code == 404:
-            return None  # There may not be a published release yet.
-        raise
+def fetch_from_channels(urls, read):
+    """Retry the complete read, then use our own repository's alternate host."""
+    errors = []
+    for url in urls:
+        for attempt in range(2):
+            try:
+                return read(Request(url, headers={"User-Agent": f"HeaderChecker/{VERSION}"}))
+            except (URLError, ConnectionError, TimeoutError, IncompleteRead, ssl.SSLError) as error:
+                errors.append(error)
+                if isinstance(error, HTTPError) and error.code != 429 and error.code < 500:
+                    break
+                if attempt == 0:
+                    time.sleep(0.5)
+    if all(isinstance(error, HTTPError) and error.code == 404 for error in errors):
+        raise errors[-1]
+    raise ConnectionError("GitHub 发布通道和仓库备用通道均未连接成功。"
+                          "能打开网页不代表能下载文件，请更换网络后重试。"
+                          f"\n最后错误：{errors[-1]}") from errors[-1]
+
+
+def validate_release(release):
+    if not isinstance(release, dict):
+        raise ValueError("发布信息格式无效")
     version = release.get("version")
-    if version_numbers(version) <= version_numbers(current):
-        return None
+    version_numbers(version)
+    if version.startswith("v"):
+        raise ValueError("发布信息版本号不能带 v 前缀")
     url = f"https://github.com/{REPOSITORY}/releases/download/v{version}/{ASSET_NAME}"
     if (release.get("url") != url or type(release.get("size")) is not int
             or not 0 < release["size"] <= 200 * 1024 * 1024
@@ -45,15 +63,32 @@ def check_for_update(current=VERSION):
     return dict(version=version, url=url, size=release["size"], sha256=release["sha256"])
 
 
+def check_for_update(current=VERSION):
+    def read(request):
+        with urlopen(request, timeout=10) as response:
+            return validate_release(json.loads(response.read(1024 * 1024)))
+
+    try:
+        release = fetch_from_channels([
+            f"https://github.com/{REPOSITORY}/releases/latest/download/update.json",
+            f"{BACKUP_ROOT}/update.json"], read)
+    except HTTPError as error:
+        if error.code == 404:
+            return None  # Neither channel has a published release yet.
+        raise
+    return release if version_numbers(release["version"]) > version_numbers(current) else None
+
+
 def download_update(release, target, progress=lambda percent: None):
+    release = validate_release(release)
     target = Path(target).resolve()
     # Keep staging and backup on the same volume as the executable; also fail
     # before downloading if its folder cannot be written by the current user.
     directory = Path(tempfile.mkdtemp(prefix="HeaderChecker-update-", dir=target.parent))
     destination = directory / ASSET_NAME
-    try:
-        request = Request(release["url"], headers={"User-Agent": f"HeaderChecker/{VERSION}"})
+    def read(request):
         digest, size, last_percent = hashlib.sha256(), 0, -1
+        progress(0)
         with urlopen(request, timeout=30) as response, destination.open("wb") as output:
             while chunk := response.read(128 * 1024):
                 size += len(chunk)
@@ -67,6 +102,9 @@ def download_update(release, target, progress=lambda percent: None):
                     last_percent = percent
         if size != release["size"] or digest.hexdigest() != release["sha256"]:
             raise ValueError("下载不完整或 SHA256 校验失败，原程序未修改")
+
+    try:
+        fetch_from_channels([release["url"], f"{BACKUP_ROOT}/v{release['version']}/{ASSET_NAME}"], read)
         with destination.open("rb") as executable:
             header = executable.read(64)
             if len(header) != 64 or header[:2] != b"MZ":

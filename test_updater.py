@@ -13,9 +13,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
-from updater import ASSET_NAME, REPOSITORY, check_for_update, download_update, start_installation
+from updater import ASSET_NAME, BACKUP_ROOT, REPOSITORY, check_for_update, download_update, start_installation
 
 
 class Updates(unittest.TestCase):
@@ -45,7 +45,7 @@ class Updates(unittest.TestCase):
         with patch('updater.urlopen', side_effect=HTTPError(url, 404, 'Not found', {}, None)):
             self.assertIsNone(check_for_update())
         with patch('updater.urlopen', side_effect=HTTPError(url, 403, 'Rate limited', {}, None)):
-            with self.assertRaises(HTTPError):
+            with self.assertRaisesRegex(ConnectionError, '备用通道'):
                 check_for_update()
 
         with tempfile.TemporaryDirectory() as directory:
@@ -66,6 +66,56 @@ class Updates(unittest.TestCase):
             with patch('updater.urlopen', return_value=io.BytesIO(invalid)), self.assertRaises(ValueError):
                 download_update(dict(result, sha256=hashlib.sha256(invalid).hexdigest()), target)
             self.assertEqual(target.read_bytes(), b'old executable')
+
+    @patch('updater.time.sleep')
+    def test_retry_and_repository_fallback_restart_partial_downloads(self, sleep):
+        executable = bytearray(128)
+        executable[:2] = b'MZ'
+        struct.pack_into('<I', executable, 60, 64)
+        executable[64:70] = b'PE\x00\x00\x64\x86'
+        release = dict(version='1.2.0', size=len(executable), sha256=hashlib.sha256(executable).hexdigest(),
+                       url=f'https://github.com/{REPOSITORY}/releases/download/v1.2.0/{ASSET_NAME}')
+        calls = []
+
+        def response(request, **kwargs):
+            calls.append(request.full_url)
+            if 'github.com/' in request.full_url:
+                raise URLError(ConnectionResetError(10054, 'Connection reset'))
+            return io.BytesIO(json.dumps(release).encode() if request.full_url.endswith('.json') else executable)
+
+        with patch('updater.urlopen', side_effect=response):
+            self.assertEqual(check_for_update('1.0.0'), release)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[-1], f'{BACKUP_ROOT}/update.json')
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / ASSET_NAME
+            target.write_bytes(b'old')
+            with patch('updater.urlopen', side_effect=response):
+                downloaded = download_update(release, target)
+            self.assertEqual(calls[-1], f'{BACKUP_ROOT}/v1.2.0/{ASSET_NAME}')
+            self.assertEqual(downloaded.read_bytes(), executable)
+            shutil.rmtree(downloaded.parent)
+
+            class Interrupted(io.BytesIO):
+                def read(self, size=-1):
+                    if self.tell():
+                        raise ConnectionResetError(10054, 'Interrupted')
+                    return super().read(40)
+
+            with patch('updater.urlopen', side_effect=[Interrupted(executable), io.BytesIO(executable)]) as opened:
+                downloaded = download_update(release, target)
+            self.assertEqual(opened.call_count, 2)
+            self.assertEqual(downloaded.read_bytes(), executable)
+            shutil.rmtree(downloaded.parent)
+            with patch('updater.urlopen', side_effect=TimeoutError('offline')) as opened:
+                with self.assertRaisesRegex(ConnectionError, '备用通道'):
+                    download_update(release, target)
+            self.assertEqual(opened.call_count, 4)
+            self.assertEqual(target.read_bytes(), b'old')
+            self.assertEqual(list(Path(directory).iterdir()), [target])
+            with patch('updater.urlopen') as opened, self.assertRaises(ValueError):
+                download_update(dict(release, url='https://example.com/app.exe'), target)
+            opened.assert_not_called()
 
     @unittest.skipUnless(sys.platform == 'win32', 'Executable replacement uses Windows PowerShell')
     def test_windows_replacement_waits_and_handles_unicode_paths(self):

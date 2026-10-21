@@ -484,7 +484,7 @@ class Application:
         self.review_report_file = tk.StringVar()
         line = ttk.Frame(match_content, style="Card.TFrame")
         line.pack(fill="x", pady=(10, 0))
-        self.structure_button = ttk.Button(line, text="扫描并试合并/拆分", command=lambda: self.start_match(structure=True), state="disabled")
+        self.structure_button = ttk.Button(line, text="合并/拆分并生成推荐", command=lambda: self.start_match(structure=True), state="disabled")
         self.structure_button.pack(side="left")
         ttk.Label(line, text="最多连续行数", style="Card.TLabel").pack(side="left", padx=(12, 4))
         self.structure_max_rows = tk.StringVar(value="8")
@@ -643,7 +643,7 @@ class Application:
         self.update_overview()
         self.start_button.configure(text="正在检查…" if running and self.report is None else "开始表头检查  →")
         self.match_button.configure(text="正在检索…" if running and self.report is not None and not self.structure_running else "检索并生成结果  →")
-        self.structure_button.configure(text="正在扫描…" if running and self.structure_running else "扫描并试合并/拆分")
+        self.structure_button.configure(text="正在扫描…" if running and self.structure_running else "合并/拆分并生成推荐")
         for widget in (self.start_button, self.browse_button, self.folder_entry, self.row_entry, *self.match_inputs, *self.scan_switches):
             widget.configure(state="disabled" if running else "normal")
         if self.ignore_error:
@@ -774,7 +774,7 @@ class Application:
             self.structure_report = None
         else:
             self.match_report = None
-        self.match_summary.set("正在检查整句匹配，再仅对 char.xlsx 反查合并；同时生成试拆分预览。" if structure else "正在检索，完成后显示结果位置。")
+        self.match_summary.set("正在检查整句匹配，再仅对 char.xlsx 反查合并；拆分和合并推荐均标记待复核。" if structure else "正在检索，完成后显示结果位置。")
         self.set_running(True)
         self.progress.configure(mode="indeterminate")
         self.progress.start(15)
@@ -882,6 +882,7 @@ class Application:
                     self.structure_running = False
                     if kind == "structure_done":
                         self.structure_report = value
+                        self.match_report = value.match_report
                         self.review_report_file.set("")
                         self.report = value.check_report
                         self.refresh_exceptions()
@@ -890,8 +891,10 @@ class Application:
                                    f"中韩格式样本 {value.pattern_samples} 条；未解释 {value.unresolved} 行；跳过或排除记录 {value.skipped} 项。\n"
                                    f"全部基准整句命中 {value.whole_matched_rows} 行；合并仅限 char.xlsx：建议 {value.merge_trial_rows} 行、待确认 {value.merge_pending_rows} 行、不适用 {value.merge_rejected_rows} 行。\n"
                                    f"试拆分 {value.trial_groups} 组 / {value.trial_segments} 条；暂不拆分 {value.trial_pending} 个源行。\n"
+                                   f"已生成综合推荐：匹配 {value.match_report.matched_rows} 行，推荐 {value.match_report.recommended_rows} 行。\n"
                                    f"结果位置：{value.destination}\n"
-                                   "打开试合并后可填写“复核填写”，选择该复核文件重跑；复核自动保存，内容变化后需重审。")
+                                   "点击“打开结果文件夹”查看基准副本；按推荐状态筛选“合并推荐·待复核”或“拆分推荐·待复核”。\n"
+                                   "试合并中的“复核填写”可保存后选择重跑；复核自动保存，内容变化后需重审。")
                         self.match_summary.set(summary)
                         self.status.set(summary.split("\n")[0])
                     else:

@@ -9,7 +9,7 @@ import sqlite3
 import tempfile
 import unicodedata
 from collections import Counter, defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -18,7 +18,7 @@ from openpyxl import Workbook, load_workbook
 
 from ignored_sheets import load_ignored, write_json
 from merge_reviews import apply_review_file, candidate_identity, load_reviews
-from matcher import (TAIL_MATCH, TEXT_TAG, baseline_sheets, breath_key, match_key, plain_key, prepare_inputs,
+from matcher import (TAIL_MATCH, TEXT_TAG, baseline_sheets, breath_key, match_folder, match_key, plain_key, prepare_inputs,
                      trailing_note_key,
                      source_metadata_columns, source_row_metadata, write_detail_sheet)
 from scanner import hidden_row_numbers, normalize, scan_folder
@@ -44,6 +44,8 @@ METADATA_HEADERS = {
 }
 MAX_CHARACTERS = 16000
 PLACEHOLDER = re.compile(r"\{[^{}\r\n]+\}|(?<!%)%(?:\d+\$)?[sd]")
+MERGE_TOKENS = re.compile(
+    f"{TEXT_TAG.pattern}|{PLACEHOLDER.pattern}|{LINE_BREAK.pattern}|[.!！。…?？]+|.", re.S)
 
 
 def comparison_key(text):
@@ -140,6 +142,7 @@ class StructureReport:
     merge_trial_rows: int
     merge_pending_rows: int
     merge_rejected_rows: int
+    match_report: object = None
 
 
 def create_index(db):
@@ -163,6 +166,9 @@ def create_index(db):
         CREATE TABLE whole_match_pairs (baseline_id INTEGER,source_id INTEGER,PRIMARY KEY(baseline_id,source_id));
         CREATE TABLE trial_coverage (source_id INTEGER PRIMARY KEY,matched INTEGER,total INTEGER);
         CREATE TABLE merge_targets (record_id INTEGER PRIMARY KEY);
+        CREATE TABLE split_recommendations (baseline_id INTEGER PRIMARY KEY,source_id INTEGER,
+            part INTEGER,total INTEGER,korean TEXT,rule TEXT,cn_start INTEGER,cn_end INTEGER,
+            ko_start INTEGER,ko_end INTEGER);
     """)
 
 
@@ -574,8 +580,35 @@ def balanced_display_tags(text):
     return not stack
 
 
+def space_merged_korean(text):
+    """Space sentence punctuation without editing tags, placeholders or decimals."""
+    result, pending = [], False
+    for match in MERGE_TOKENS.finditer(text):
+        token = match.group()
+        if TEXT_TAG.fullmatch(token):
+            result.append(token)
+            continue
+        if token.isspace() or LINE_BREAK.fullmatch(token):
+            pending = False
+        elif re.fullmatch(r"[.!！。…?？]+", token):
+            before, after = text[match.start() - 1:match.start()], text[match.end():match.end() + 1]
+            dotted_word = token == "." and (
+                all(c and c.isascii() and c.isalnum() for c in (before, after))
+                or (after.isdigit() and (not before or before.isspace() or before in "(（[+-")))
+            pending = not dotted_word and any(c in ".!！。…" for c in token)
+        elif len(token) == 1 and (unicodedata.category(token) in ("Pe", "Pf")
+                                 or token in "\"'，,、;；:："):
+            pass  # Keep closing quotes and punctuation clusters together.
+        else:
+            if pending:
+                result.append(" ")
+            pending = False
+        result.append(token)
+    return "".join(result)
+
+
 def trial_merge(sources, baseline):
-    """Keep sentence boundaries visible in this preview; don't invent Korean spacing."""
+    """Join complete translated rows with spaces; preserve the source evidence."""
     if "".join(comparison_key(s["original"]) for s in sources) != comparison_key(baseline["original"]):
         return None, "连续源中文未完整覆盖基准"
     content = PLACEHOLDER.sub("", comparison_key(baseline["original"]))
@@ -588,7 +621,7 @@ def trial_merge(sources, baseline):
             return None, f"源行{source['row']}中韩占位符不一致"
         if not all(balanced_display_tags(source[key]) for key in ("original", "korean")):
             return None, f"源行{source['row']}展示标签跨行或未闭合"
-    return "\n".join(s["korean"].strip() for s in sources), ""
+    return space_merged_korean(" ".join(s["korean"].strip() for s in sources)), ""
 
 
 def metadata_text(rows):
@@ -613,6 +646,27 @@ def metadata_conflict(sources, baseline):
     if len(known(metadata[:-1], "语音类型")) > 1:
         return "连续台词的语音类型不同"
     return ""
+
+
+def merge_overlap_evidence(candidate, by_baseline, owners):
+    """Permit full-row prefix/suffix reuse, never ambiguous or identical positions."""
+    ids = tuple(s["id"] for s in candidate["sources"])
+    others = set().union(*(owners[i] for i in ids)) - {candidate["baseline"]["id"]}
+    excerpts = []
+    for baseline_id in sorted(others):
+        group = by_baseline[baseline_id]
+        if len(group) != 1:
+            return True, ""
+        other = tuple(s["id"] for s in group[0]["sources"])
+        small, large = sorted((ids, other), key=len)
+        if len(small) == len(large) or small not in (large[:len(small)], large[-len(small):]):
+            return True, ""
+        if ids == small:
+            side = "结尾" if small == large[:len(small)] else "开头"
+            other_baseline = group[0]["baseline"]
+            excerpts.append(f"相对基准{other_baseline['path']} / {other_baseline['sheet']} / 行{other_baseline['row']}"
+                            f"省略{side}{len(large) - len(small)}条完整源台词")
+    return False, "；".join(excerpts)
 
 
 def merge_assessments(db, reviews, review_report):
@@ -644,6 +698,8 @@ def merge_assessments(db, reviews, review_report):
             stale = review is not None and review["fingerprint"] != candidate["fingerprint"]
             decision = "" if review is None or stale else review["decision"]
             candidate.update(review=review, stale=stale, decision=decision)
+            shared_conflict, excerpt = merge_overlap_evidence(candidate, by_baseline, owners)
+            candidate["excerpt"] = excerpt
             state, reason = "待确认", "缺少唯一邻句定位证据；同角色、同译文不能确认位置"
             if decision == "不适用":
                 state, reason = "不适用", "人工复核不适用：" + review["comment"]
@@ -655,12 +711,14 @@ def merge_assessments(db, reviews, review_report):
                 reason = "复核已过期：内容、角色或相关上下文已变化，需要重新确认"
             elif decision == "待确认":
                 reason = "人工保留待确认：" + review["comment"]
-            elif any(len(owners[s["id"]]) > 1 for s in candidate["sources"]):
+            elif shared_conflict:
                 reason = "源行同时参与多个基准的合并候选，位置归属不唯一"
             elif decision == "可适用":
                 state, reason = "人工确认可适用", review["comment"] or "复核确认本组对应关系"
             elif len(group) > 1:
                 reason = "存在多个来源，需确认具体位置；即使译文相同也不自动采用"
+            elif excerpt:
+                state, reason = "可试合并", excerpt + "；连续源行完整覆盖较短基准句，需复核删减范围"
             elif candidate["anchored"]:
                 state, reason = "可试合并", "唯一邻句定位通过；语义仍待人工复核"
             candidate.update(state=state, reason=reason)
@@ -759,14 +817,14 @@ def write_merge_trial_report(db, destination, max_rows, progress, assessments):
         ["合并范围", "story.xlsx及其他基准不参与合并反查；未读取到char.xlsx正文时合并候选为零，不扩大到其他文件。分文件数量见合并范围表"],
         ["已知场景", "目前已确认样本来自角色必杀技分段台词；语音名及播放说明供核对，char.xlsx中的其他候选仍需定位或人工确认"],
         ["命中与推荐", "整句命中检查不代替正式匹配的上下文推荐；有中文候选但缺译或冲突的行不算未匹配，不用合并覆盖"],
-        ["合并方式", "按源实际行号顺序，以实际换行连接去除首尾空白后的韩文；内部换行、标签、标点、占位符保留；保留整组原文供回查"],
-        ["采用条件", "人工明确确认，或单一来源且有双方全文唯一的连续邻句证据；角色/剧情段冲突、缺译、占位符或标签异常、跨基准争用仍阻止采用"],
+        ["合并方式", "按源实际行号顺序，以一个空格连接去除首尾空白后的韩文；句中省略号、叹号、句号后补空格，已有空白不重复补。句尾不补，小数、标签与占位符内部不改；原文另列供回查"],
+        ["采用条件", "人工明确确认，或单一来源且有唯一邻句证据；也支持相对唯一长句仅省略首尾完整源行的短句。角色/剧情段冲突、缺译、占位符或标签异常、其他跨基准争用仍阻止采用"],
         ["多个候选", "同角色或同译文不代表同一位置；多个来源须明确复核具体一组；理论可用归为待确认"],
         ["复核方法", "在复核填写中填写可适用、不适用或待确认及意见；界面选择该文件后重跑。空结论不覆盖旧记录，颜色不作为批准"],
         ["复核保存", "结论保存在输出根目录合并复核记录.json，下次扫描自动读取。路径、行号变化后需重新对应；内容、角色或相关上下文变化后旧复核失效"],
         ["范围外复核", "历史story复核记录保留但不参与本次合并；含范围外候选的旧复核表请勿重导，应使用最新复核填写表"],
         ["范围", f"沿用结构差异扫描.xlsx中的范围和跳过清单，最多连续{max_rows}行；反查未命中不代表不存在对应；拆分预览仍独立生成"],
-        ["试用阶段", "仅生成独立合并建议，语义及位置仍需复核；未改动原文件、未回填TextTrans，也未改写正式匹配结果"],
+        ["推荐写入", "符合条件的建议写入推荐结果目录中的基准副本，状态为合并推荐·待复核；已有整句推荐不覆盖，结构推荐竞争时暂不写入。未改动原文件与TextTrans"],
     ], [38, 115])
     book.save(destination)
     book.close()
@@ -864,6 +922,11 @@ def write_trial_report(db, destination, progress, max_rows=8):
             else:
                 accepted.append((index, get_record(db, ids[0])))
                 db.execute("INSERT OR IGNORE INTO covered VALUES (?)", (ids[0],))
+                cn, ko = patterns
+                translation = trim_segment(ko["parts"][index]) if cn["labels"] else ko["parts"][index]
+                db.execute("INSERT INTO split_recommendations VALUES (?,?,?,?,?,?,?,?,?,?)",
+                           (ids[0], source["id"], index, len(choices), translation, cn["rule"],
+                            *cn["spans"][index], *ko["spans"][index]))
         db.execute("INSERT INTO trial_coverage VALUES (?,?,?)", (source["id"], len(accepted), len(choices)))
         if accepted:
             groups.append((source, accepted, patterns))
@@ -915,13 +978,36 @@ def write_trial_report(db, destination, progress, max_rows=8):
         ["位置要求", "优先采用唯一的整组连续对应；其他段只有唯一基准位置且无来源冲突才出预览；所有对应仅供复核"],
         ["文本处理", "编号模式移除编号及分段首尾空白；换行模式保留每段韩语原值和编号。两侧仅去除空白边缘行，内部空行不跳过，不按中文长度切韩语"],
         ["拒绝条件", "前缀、重复或跳号、空段、选项内部换行、中韩占位符差异、跨段或未闭合展示标签均暂不拆分"],
-        ["待复核", "本表仅为试拆分预览，编号一致不证明译文语义正确；不回填基准TextTrans，不改动输入文件"],
+        ["待复核", "符合条件的分段写入推荐结果中的基准副本，状态为拆分推荐·待复核；已有整句推荐不覆盖。编号一致不证明语义正确，不回填TextTrans，不改动输入文件"],
         ["部分匹配", "拆分明细只列可定位的段；其余见分段未匹配，全部对应见分段候选；暂不拆分包含部分匹配组的剩余问题"],
         ["覆盖范围", "沿用同目录结构差异扫描.xlsx的扫描设置及跳过清单；暂不拆分只列格式或拆分候选，不代表所有这些行都需要拆分"],
     ], [24, 110])
     book.save(destination)
     book.close()
     return len(groups), segments, len(pending)
+
+
+def structure_recommendations(db, assessments):
+    def item(baseline, sources, korean, kind, group_id, basis, **extra):
+        return dict(path=baseline["path"], sheet=baseline["sheet"], row=baseline["row"],
+                    chinese=baseline["original"], korean=korean, kind=kind, group_id=group_id, basis=basis,
+                    source="\n".join(f"{s['path']}；Sheet：{s['sheet']}；行号：{s['row']}" for s in sources),
+                    sources=[dict(s) for s in sources], **extra)
+
+    for candidate in assessments.values():
+        if candidate["state"] in ("可试合并", "人工确认可适用"):
+            yield item(candidate["baseline"], candidate["sources"], candidate["translation"], "合并",
+                       f"M{candidate['baseline']['id']}",
+                       f"{candidate['state']}：{candidate['reason']}；{candidate['evidence']}；"
+                       "按源行顺序以空格合并韩文，补充句中省略号、叹号和句号后的空格；仍需复核标点、标签及语义")
+    for row in db.execute("SELECT * FROM split_recommendations ORDER BY baseline_id"):
+        source = get_record(db, row["source_id"])
+        baseline = get_record(db, row["baseline_id"])
+        yield item(baseline, [source], row["korean"], "拆分", f"T{source['id']}",
+                   f"{row['rule']}，第{row['part'] + 1}/{row['total']}段；"
+                   f"源中文字符{row['cn_start'] + 1}～{row['cn_end']}，韩文字符{row['ko_start'] + 1}～{row['ko_end']}；"
+                   "唯一分段定位；仍需复核语义、编号、标点及标签",
+                   part=row["part"], total=row["total"])
 
 
 def write_report(db, destination, skipped, report, baseline_root, max_rows, progress, assessments):
@@ -953,10 +1039,10 @@ def write_report(db, destination, skipped, report, baseline_root, max_rows, prog
         ["扫描时间", datetime.now().isoformat(timespec="seconds")], ["最大连续行数", max_rows],
         ["最大拼接字符数", MAX_CHARACTERS],
         ["比较规则", "去首尾空白，忽略<color>等英文尖括号标签、实际与字面换行；保留占位符、内部空格及标点；原文与译文标签保留供复核"],
-        ["候选含义", "仅发现当前数据中的可能对应关系；不自动分配、合并或回填译文；不执行单侧增删扫描"],
+        ["候选含义", "本报告保留全部可能对应关系；符合条件的拆分合并写入基准副本推荐列并标注待复核。未写入原因见推荐结果中的匹配明细，不执行单侧增删扫描"],
         ["合并反查顺序", "先对全部基准检查整句命中；只有char.xlsx（文件名不区分大小写）中无中文候选的行参与合并反查，已有候选但缺译或冲突的行保留常规处理"],
         ["合并范围", "story.xlsx及其他基准不参与合并反查；继续整句匹配及拆分扫描。范围外行不能标记为反查未命中，分文件统计见试合并结果.xlsx的合并范围表"],
-        ["试合并预览", "同目录试合并结果.xlsx提供换行连接的韩文预览、全部候选、整句命中检查和流程统计"],
+        ["试合并预览", "同目录试合并结果.xlsx提供空格连接并处理句中标点空格的韩文预览、全部候选、整句命中检查和流程统计"],
         ["试拆分预览", "同目录试拆分结果.xlsx按数字编号或换行生成独立中韩分段预览，支持部分定位，具体条件见拆分说明；候选仍需人工复核"],
         ["窗口边界", "同文件同Sheet连续物理行；不跨空白、非文本、排除行或显式场景变化。没有场景列时无法保证不跨语义场景"],
         ["场景识别", "可识别场景、场景名、场景编号中的唯一列，非空场景值沿用到下次变化；多个场景列需先澄清"],
@@ -979,6 +1065,7 @@ def scan_structure(report, baseline_root, output_root, ignored_sheets=(), progre
     progress = progress or (lambda text: None)
     fresh, candidates, skipped, baselines, baseline_root, output_root = prepare_inputs(
         report, baseline_root, output_root, ignored_sheets, progress)
+    versions = {p: (p.stat().st_mtime_ns, p.stat().st_size) for p in [*candidates, *baselines]}
     output_root.mkdir(parents=True, exist_ok=True)
     review_path = output_root / "合并复核记录.json"
     reviews = load_reviews(review_path)
@@ -1000,6 +1087,16 @@ def scan_structure(report, baseline_root, output_root, ignored_sheets=(), progre
             merge_counts = write_merge_trial_report(db, staging / "试合并结果.xlsx", max_rows, progress, assessments)
             source_rows, baseline_rows = [db.execute("SELECT COUNT(*) FROM records WHERE kind=?", (k,)).fetchone()[0]
                                           for k in ("source", "baseline")]
+            progress("生成包含整句、合并与拆分推荐的基准副本及明细")
+            matched = match_folder(fresh, baseline_root, staging, ignored_sheets, progress,
+                                   structure_candidates=structure_recommendations(db, assessments))
+            if (any((p.stat().st_mtime_ns, p.stat().st_size) != version for p, version in versions.items())
+                    or matched.baseline_files != len(baselines)
+                    or set(matched.check_report.file_paths) != set(fresh.file_paths)):
+                raise ValueError("扫描期间输入文件或范围已变化，请重新执行，未保存本次结果")
+            os.rename(matched.destination, staging / "推荐结果")
+            matched = replace(matched, destination=staging / "推荐结果",
+                              outputs=[staging / "推荐结果" / p.relative_to(matched.destination) for p in matched.outputs])
         finally:
             db.close()
         (staging / "index.sqlite3").unlink()
@@ -1011,7 +1108,9 @@ def scan_structure(report, baseline_root, output_root, ignored_sheets=(), progre
     except Exception:
         shutil.rmtree(destination)
         raise
-    return StructureReport(destination, fresh, source_rows, baseline_rows, *counts, len(skipped), *trial_counts, *merge_counts)
+    matched = replace(matched, destination=destination / "推荐结果",
+                      outputs=[destination / "推荐结果" / p.relative_to(matched.destination) for p in matched.outputs])
+    return StructureReport(destination, fresh, source_rows, baseline_rows, *counts, len(skipped), *trial_counts, *merge_counts, matched)
 
 
 if __name__ == "__main__":
@@ -1032,3 +1131,4 @@ if __name__ == "__main__":
     print(result.destination / "试拆分结果.xlsx")
     print(f"整句命中 {result.whole_matched_rows} 行；试合并 {result.merge_trial_rows} 行；待确认 {result.merge_pending_rows} 行；不适用 {result.merge_rejected_rows} 行")
     print(result.destination / "试合并结果.xlsx")
+    print(f"综合推荐：{result.match_report.recommended_rows}行；结果目录：{result.match_report.destination}")

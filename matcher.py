@@ -307,13 +307,16 @@ class BaselineWriter(XMLGenerator):
                     count, missing = summary if summary else (0, 0)
                     self.matched_rows += bool(count)
                     if 0 < count <= 3:
-                        hits = self.connection.execute("""SELECT s.chinese,s.korean,s.path,s.sheet,s.row
+                        hits = self.connection.execute("""SELECT s.chinese,s.korean,
+                            s.path || '；Sheet：' || s.sheet || '；行号：' || s.row AS source,s.rowid AS ordering
                             FROM comparisons e JOIN source_rows s ON s.rowid=e.source_id
-                            WHERE e.path=? AND e.sheet=? AND e.row=? ORDER BY s.rowid LIMIT 3""", key)
-                        for index, (chinese, korean, filename, title, number) in enumerate(hits):
+                            WHERE e.path=? AND e.sheet=? AND e.row=?
+                            UNION ALL SELECT chinese,korean,source,9223372036854775807 FROM structure_recommendations
+                            WHERE path=? AND sheet=? AND row=? ORDER BY ordering LIMIT 3""", (*key, *key))
+                        for index, (chinese, korean, source, _) in enumerate(hits):
                             chinese = align_boundary_newlines(chinese, keep_start, keep_end)
                             korean = align_boundary_newlines(korean, keep_start, keep_end)
-                            for offset, value in enumerate((chinese, korean, f"{filename}；Sheet：{title}；行号：{number}")):
+                            for offset, value in enumerate((chinese, korean, source)):
                                 self.output_cell(18 + index * 3 + offset, value)
                     self.output_cell(27, count)
                     self.output_cell(28, missing)
@@ -325,9 +328,13 @@ class BaselineWriter(XMLGenerator):
                         WHERE r.path=? AND r.sheet=? AND r.row=?
                     """, (self.path, self.sheet, self.row)).fetchone()
                     korean, filename, title, number, basis, status = recommendation
+                    source = f"{filename}；Sheet：{title}；行号：{number}" if filename is not None else None
+                    structural = self.connection.execute("""SELECT korean,source,basis,status
+                        FROM structure_recommendations WHERE path=? AND sheet=? AND row=?""", key).fetchone()
+                    if structural:
+                        korean, source, basis, status = structural
                     self.output_cell(30, align_boundary_newlines(korean, keep_start, keep_end))
-                    if filename is not None:
-                        self.output_cell(31, f"{filename}；Sheet：{title}；行号：{number}")
+                    self.output_cell(31, source)
                     self.output_cell(32, basis)
                     self.output_cell(33, status)
             self.row = None
@@ -477,6 +484,15 @@ def build_recommendations(connection, progress=None):
         CREATE TABLE recommendations (path TEXT,sheet TEXT,row INTEGER,source_id INTEGER,basis TEXT,status TEXT,match_type TEXT,
             PRIMARY KEY(path,sheet,row));
         CREATE INDEX recommendation_source ON recommendations(source_id);
+        CREATE TABLE structure_recommendations (path TEXT,sheet TEXT,row INTEGER,chinese TEXT,korean TEXT,
+            source TEXT,basis TEXT,status TEXT,kind TEXT,group_id TEXT,PRIMARY KEY(path,sheet,row));
+        CREATE TABLE structure_sources (path TEXT,sheet TEXT,row INTEGER,source_id INTEGER,
+            part INTEGER,total INTEGER,complete INTEGER,PRIMARY KEY(path,sheet,row,source_id));
+        CREATE INDEX structure_source_id ON structure_sources(source_id);
+        CREATE TABLE structure_pending (path TEXT,sheet TEXT,row INTEGER,chinese TEXT,korean TEXT,
+            source TEXT,basis TEXT,status TEXT,kind TEXT,group_id TEXT,reason TEXT);
+        CREATE TABLE structure_pending_sources (source_id INTEGER,reason TEXT);
+        CREATE INDEX structure_pending_source ON structure_pending_sources(source_id);
     """)
     for source_id, path, sheet, sequence in connection.execute("SELECT DISTINCT rowid,path,sheet,seq FROM hits"):
         previous, following = read_context(connection, "source_context_rows", path, sheet, sequence)
@@ -626,6 +642,48 @@ def build_recommendations(connection, progress=None):
     return recommended
 
 
+def apply_structure_recommendations(connection, candidates):
+    """Supplement unresolved targets and retain physical sources for every segment."""
+    groups = {}
+    for item in candidates:
+        key = (item["path"], item["sheet"], item["row"])
+        groups.setdefault(key, []).append(item)
+    for key, items in groups.items():
+        baseline = connection.execute("SELECT text FROM baseline_rows WHERE path=? AND sheet=? AND row=?", key).fetchone()
+        chosen = connection.execute("SELECT source_id FROM recommendations WHERE path=? AND sheet=? AND row=?", key).fetchone()
+        for item in items:
+            if baseline is None or baseline[0] != match_key(item["chinese"]):
+                raise ValueError("结构扫描后的基准内容已变化，请重新扫描")
+            source_ids = []
+            for source in item["sources"]:
+                record = connection.execute("""SELECT rowid,chinese,korean FROM source_rows
+                    WHERE path=? AND sheet=? AND row=?""", (source["path"], source["sheet"], source["row"])).fetchone()
+                if record is None or record[1] != source["original"] or (record[2] or "") != source["korean"]:
+                    raise ValueError("结构扫描后的源内容或参与范围已变化，请重新扫描")
+                source_ids.append(record[0])
+            if not source_ids or not match_key(item["korean"]) or item["kind"] not in ("合并", "拆分"):
+                raise ValueError("结构推荐缺少来源、译文或有效类型")
+            values = (*key, item["chinese"], item["korean"], item["source"], item["basis"],
+                      item["kind"] + "推荐·待复核", item["kind"], item["group_id"])
+            reason = "保留已有整句推荐" if chosen[0] is not None else "同一基准有多个结构推荐，需确认采用哪一组" if len(items) > 1 else ""
+            if reason:
+                connection.execute("INSERT INTO structure_pending VALUES (?,?,?,?,?,?,?,?,?,?,?)", (*values, reason))
+                connection.executemany("INSERT INTO structure_pending_sources VALUES (?,?)", [(sid, reason) for sid in source_ids])
+                continue
+            connection.execute("INSERT INTO structure_recommendations VALUES (?,?,?,?,?,?,?,?,?,?)", values)
+            connection.executemany("INSERT INTO structure_sources VALUES (?,?,?,?,?,?,?)",
+                [(*key, sid, item.get("part", 0), item.get("total", 1), int(item["kind"] == "合并")) for sid in source_ids])
+            connection.executemany("INSERT OR IGNORE INTO matched_sources VALUES (?)", [(sid,) for sid in source_ids])
+            variants = connection.execute("""SELECT COUNT(*) FROM (
+                SELECT s.korean_key FROM comparisons c JOIN source_rows s ON s.rowid=c.source_id
+                WHERE c.path=? AND c.sheet=? AND c.row=? AND s.korean_key!='' UNION SELECT ?
+            )""", (*key, match_key(item["korean"]))).fetchone()[0]
+            connection.execute("""INSERT INTO baseline_counts VALUES (?,?,?,1,0,?)
+                ON CONFLICT(path,sheet,row) DO UPDATE SET n=n+1,variants=excluded.variants""", (*key, variants))
+    connection.commit()
+    return connection.execute("SELECT COUNT(*) FROM structure_recommendations").fetchone()[0]
+
+
 def write_baseline_statistics(destination, connection, baseline_parts):
     headers = ["非空中文行数", "中文匹配行数", "有译文行数", "推荐行数", "未匹配行数", "命中但全缺译行数",
                "冲突行数", "冲突已推荐行数", "冲突待确认行数", "中文匹配率", "译文覆盖率", "推荐率"]
@@ -635,11 +693,12 @@ def write_baseline_statistics(destination, connection, baseline_parts):
         arguments = (str(path), sheet) if sheet is not None else (str(path),)
         n, matched, available, recommended, missing, conflicts, resolved = connection.execute(f"""
             SELECT COUNT(*),COALESCE(SUM(c.n>0),0),COALESCE(SUM(c.variants>0),0),
-                   COALESCE(SUM(r.source_id IS NOT NULL),0),COALESCE(SUM(c.variants=0),0),
-                   COUNT(f.row),COALESCE(SUM(f.row IS NOT NULL AND r.source_id IS NOT NULL),0)
+                   COALESCE(SUM(r.source_id IS NOT NULL OR t.row IS NOT NULL),0),COALESCE(SUM(c.variants=0),0),
+                   COUNT(f.row),COALESCE(SUM(f.row IS NOT NULL AND (r.source_id IS NOT NULL OR t.row IS NOT NULL)),0)
             FROM baseline_rows b LEFT JOIN baseline_counts c ON c.path=b.path AND c.sheet=b.sheet AND c.row=b.row
             LEFT JOIN baseline_counts f ON f.path=b.path AND f.sheet=b.sheet AND f.row=b.row AND f.variants>1
-            JOIN recommendations r ON r.path=b.path AND r.sheet=b.sheet AND r.row=b.row WHERE {clause}
+            JOIN recommendations r ON r.path=b.path AND r.sheet=b.sheet AND r.row=b.row
+            LEFT JOIN structure_recommendations t ON t.path=b.path AND t.sheet=b.sheet AND t.row=b.row WHERE {clause}
         """, arguments).fetchone()
         return [n, matched, available, recommended, n - matched, missing, conflicts, resolved, conflicts - resolved]
 
@@ -671,11 +730,13 @@ def write_matching_details(destination, connection, progress=None):
                CASE WHEN c.variants>1 THEN '是' ELSE '否' END,
                e.baseline_previous,e.baseline_following,e.source_previous,e.source_following,
                e.previous_equal,e.following_equal,e.full_sides,
-               CASE WHEN r.source_id=s.rowid THEN '是' ELSE '否' END,r.status,r.basis,e.match_type,e.skipped,e.query_statistics
+               CASE WHEN r.source_id=s.rowid THEN '是' ELSE '否' END,
+               COALESCE(t.status,r.status),COALESCE(t.basis,r.basis),e.match_type,e.skipped,e.query_statistics
         FROM comparisons e JOIN source_rows s ON s.rowid=e.source_id
         JOIN baseline_rows b ON b.path=e.path AND b.sheet=e.sheet AND b.row=e.row
         JOIN baseline_counts c ON c.path=b.path AND c.sheet=b.sheet AND c.row=b.row
         JOIN recommendations r ON r.path=b.path AND r.sheet=b.sheet AND r.row=b.row
+        LEFT JOIN structure_recommendations t ON t.path=b.path AND t.sheet=b.sheet AND t.row=b.row
         ORDER BY s.rowid,b.path,b.sheet,b.row
     """)
     rows = ([Path(b).name,b,bs,br,Path(p).name,p,ss,sr,cn,ko,missing,conflict,
@@ -690,6 +751,14 @@ def write_matching_details(destination, connection, progress=None):
                                 "基准前3句","基准后3句","来源前3句","来源后3句","前句一致数","后句一致数","完整一致侧数","一致位置总数","推荐来源","推荐状态","推荐依据","匹配方式",
                                 "完美匹配","上下文跳过位置","上下文查询统计"],
                                rows, [30,65,25,16,35,65,25,16,55,55,12,16,65,65,65,65,18,18,20,20,16,24,70,24,16,75,75], progress)
+    structure_headers = ["基准完整路径", "基准Sheet", "基准行号", "基准中文", "推荐韩语", "推荐来源",
+                         "推荐依据", "推荐状态", "类型", "组ID"]
+    pairs += write_detail_sheet(book, "合并拆分推荐", structure_headers,
+        connection.execute("SELECT * FROM structure_recommendations ORDER BY path,sheet,row"),
+        [60, 22, 14, 70, 75, 80, 90, 26, 14, 18], progress)
+    write_detail_sheet(book, "结构推荐未写入", [*structure_headers, "未写入原因"],
+        connection.execute("SELECT * FROM structure_pending ORDER BY path,sheet,row"),
+        [60, 22, 14, 70, 75, 80, 90, 26, 14, 18, 75], progress)
     write_detail_sheet(book, "上下文排除明细",
         ["源完整路径", "源Sheet", "源行号", "源中文", "源韩文", "特殊说明", "说话角色名", "处理"],
         connection.execute("SELECT * FROM context_exclusions ORDER BY path,sheet,row"),
@@ -712,11 +781,20 @@ def write_matching_details(destination, connection, progress=None):
         WITH recommended_pairs AS (
             SELECT DISTINCT chosen.text,chosen.korean_key
             FROM recommendations r JOIN source_rows chosen ON chosen.rowid=r.source_id
+            UNION SELECT chosen.text,chosen.korean_key FROM source_rows chosen JOIN (
+                SELECT source_id FROM structure_sources GROUP BY source_id
+                HAVING MAX(complete)=1 OR COUNT(DISTINCT part)=MAX(total)
+            ) covered ON covered.source_id=chosen.rowid
         )
         SELECT s.path,s.sheet,s.row,s.chinese,s.korean,
                CASE WHEN t.source_id IS NOT NULL THEN '是' ELSE '否' END,
                CASE WHEN s.korean_key='' THEN '是' ELSE '否' END,
-               CASE WHEN t.source_id IS NULL THEN '基准文件中找不到'
+               CASE WHEN EXISTS (SELECT 1 FROM structure_sources u WHERE u.source_id=s.rowid)
+                    THEN '拆分后仅部分分段获推荐，剩余分段待复核'
+                    WHEN EXISTS (SELECT 1 FROM structure_pending_sources p WHERE p.source_id=s.rowid)
+                    THEN '结构候选未写入：' || (SELECT GROUP_CONCAT(DISTINCT p.reason)
+                                              FROM structure_pending_sources p WHERE p.source_id=s.rowid)
+                    WHEN t.source_id IS NULL THEN '基准文件中找不到'
                     ELSE '基准文件中找到了但不符合推荐规则' END
         FROM source_rows s LEFT JOIN matched_sources t ON t.source_id=s.rowid
         WHERE NOT EXISTS (SELECT 1 FROM recommended_pairs r
@@ -827,7 +905,7 @@ def prepare_inputs(report, baseline_root, output_root, ignored_sheets=(), progre
     return fresh, candidates, skipped, baselines, baseline_root, output_root
 
 
-def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress=None):
+def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress=None, structure_candidates=()):
     fresh, candidates, skipped, baselines, baseline_root, output_root = prepare_inputs(
         report, baseline_root, output_root, ignored_sheets, progress)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -985,6 +1063,7 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
             if progress:
                 progress("比较前后三句并生成推荐……")
             recommended_rows = build_recommendations(connection, progress)
+            recommended_rows += apply_structure_recommendations(connection, structure_candidates)
             for row in sheet_rows:
                 row[4] = connection.execute("""SELECT COUNT(*) FROM source_rows s JOIN matched_sources m ON m.source_id=s.rowid
                     WHERE s.path=? AND s.sheet=?""", (row[1], row[2])).fetchone()[0]

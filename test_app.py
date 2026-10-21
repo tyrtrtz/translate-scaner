@@ -178,7 +178,12 @@ class DesktopWorkflow(unittest.TestCase):
                 opened.assert_called_once_with(app.structure_report.destination / "试合并结果.xlsx")
             self.assertIn("扫描完成", app.match_summary.get())
             self.assertIn("合并仅限 char.xlsx", app.match_summary.get())
-            self.assertIsNotNone(app.match_report, "Scanning should keep the previous matching result accessible")
+            self.assertIs(app.match_report, app.structure_report.match_report)
+            self.assertEqual(app.match_report.destination, app.structure_report.destination / '推荐结果')
+            self.assertIn('合并推荐·待复核', app.match_summary.get())
+            with patch('app.open_path') as opened:
+                app.match_details_button.invoke()
+                opened.assert_called_once_with(app.match_report.destination / '匹配明细.xlsx')
             for widget in (app.structure_button, app.structure_open_button, app.trial_open_button, app.merge_open_button,
                            app.structure_rows_entry, app.review_file_button, app.review_clear_button):
                 self.assertGreaterEqual(widget.winfo_width(), widget.winfo_reqwidth())

@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-VERSION = "1.1.8"
+VERSION = "1.1.9"
 REPOSITORY = "tyrtrtz/translate-scaner"
 ASSET_NAME = "HeaderChecker.exe"
 BACKUP_ROOT = f"https://raw.githubusercontent.com/{REPOSITORY}/updates"

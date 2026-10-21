@@ -11,7 +11,7 @@ from openpyxl import Workbook, load_workbook
 from ignored_sheets import sheet_key
 from matcher import match_folder
 from scanner import scan_folder
-from structure_scan import bilingual_evidence, comparison_key, scan_structure, split_patterns, split_translation, trial_merge, trial_numbered_split
+from structure_scan import bilingual_evidence, comparison_key, scan_structure, space_merged_korean, split_patterns, split_translation, trial_merge, trial_numbered_split
 
 
 class StructureScanTests(unittest.TestCase):
@@ -151,7 +151,7 @@ class StructureScanTests(unittest.TestCase):
         self.assertEqual(sheets["合并候选"][1][9], "6")
         book = load_workbook(result.destination / "试合并结果.xlsx")
         self.addCleanup(book.close)
-        self.assertEqual(book["全部反查候选"]["D2"].value, "=새1\n새2")
+        self.assertEqual(book["全部反查候选"]["D2"].value, "=새1 새2")
         self.assertEqual(book["全部反查候选"]["D2"].data_type, "s")
         self.assertEqual(book["全部反查候选"]["M2"].value, 6)
         whole = {row[3]: row for row in list(book["整句命中检查"].values)[1:]}
@@ -410,7 +410,7 @@ class StructureScanTests(unittest.TestCase):
         sources = [dict(row=2, original="甲{playername}", korean="=가{playername} "),
                    dict(row=3, original="乙%s", korean="<color=red>나%s</color>")]
         self.assertEqual(trial_merge(sources, dict(original="甲{playername}乙%s")),
-                         ("=가{playername}\n<color=red>나%s</color>", ""))
+                         ("=가{playername} <color=red>나%s</color>", ""))
         for sources, baseline, expected in [
             ([dict(row=2, original="……", korean="..."), dict(row=3, original="……", korean="...")],
              "…………", "缺少可确认"),
@@ -423,6 +423,146 @@ class StructureScanTests(unittest.TestCase):
                 translation, reason = trial_merge(sources, dict(original=baseline))
                 self.assertIsNone(translation)
                 self.assertIn(expected, reason)
+
+    def test_merge_full_row_prefix_suffix_reuse_keeps_ambiguous_overlap_pending(self):
+        self.workbook(self.source, [['台词', '한국어'], ['前锚', '앞'],
+                                   ['玉枝倚宝扇…', '옥가지를 부채에 기대어...'],
+                                   ['花间千丝系尘缘——', '천 갈래 실이 인연을 묶나니—'],
+                                   ['因果已结！', '인과여, 맺어져라!'], ['后锚', '뒤']])
+        parts = ['玉枝倚宝扇…', '花间千丝系尘缘——', '因果已结！']
+        for shortened, expected, side in [
+            (parts[1:], '천 갈래 실이 인연을 묶나니— 인과여, 맺어져라!', '开头'),
+            (parts[:2], '옥가지를 부채에 기대어... 천 갈래 실이 인연을 묶나니—', '结尾'),
+        ]:
+            with self.subTest(side=side):
+                self.workbook(self.baseline, [['Text'], ['前锚'], [''.join(parts)], ['后锚'], [None], [''.join(shortened)]])
+                result, sheets = self.scan()
+                self.assertEqual((result.merge_candidates, result.merge_trial_rows), (2, 2))
+                short = next(r for r in sheets['合并候选'][1:] if r[9] == '6')
+                self.assertIn(f'省略{side}1条完整源台词', short[12])
+                book = load_workbook(result.destination / '试合并结果.xlsx')
+                try:
+                    accepted = {r[7]: r for r in list(book['合并建议'].values)[1:]}
+                    self.assertEqual(accepted[6][2], expected)
+                finally:
+                    book.close()
+        # Identical windows at different baseline positions remain ambiguous.
+        self.workbook(self.baseline, [['Text'], [''.join(parts)], [None], [''.join(parts)]])
+        result, _ = self.scan()
+        self.assertEqual((result.merge_trial_rows, result.merge_pending_rows), (0, 2))
+
+    def test_merge_korean_sentence_spacing_preserves_protected_content(self):
+        for original, expected in [
+            ('가...나!다.라…마！바。끝...', '가... 나! 다. 라… 마！ 바。 끝...'),
+            ('가...?!나!!다', '가...?! 나!! 다'),
+            ('가. 나!  다…\n라', '가. 나!  다…\n라'),
+            ('가.\\n나!\\r\\n다', '가.\\n나!\\r\\n다'),
+            ('3.14 v1.2 A.B 가.나', '3.14 v1.2 A.B 가. 나'),
+            ('.5 -.5 (.5) 가.5개', '.5 -.5 (.5) 가. 5개'),
+            ('「가!」나', '「가!」 나'),
+            ('<color=#1.2>가!</color><b>나</b>', '<color=#1.2>가!</color><b> 나</b>'),
+            ('가!{player.name}나', '가! {player.name}나'),
+            ('<b>가...</b>', '<b>가...</b>'),
+        ]:
+            with self.subTest(original=original):
+                self.assertEqual(space_merged_korean(original), expected)
+                self.assertEqual(space_merged_korean(expected), expected)
+        sources = [dict(row=2, original='甲…', korean=' 가... '),
+                   dict(row=3, original='乙！', korean='나!다.'),
+                   dict(row=4, original='丙。', korean='라.')]
+        self.assertEqual(trial_merge(sources, dict(original='甲…乙！丙。')), ('가... 나! 다. 라.', ''))
+
+    def test_structure_recommendations_fill_copies_and_keep_whole_recommendations_and_partial_sources(self):
+        source = self.workbook(self.source, [
+            ['台词', '한국어'], ['前锚', '앞'], ['甲…', '가...'], ['乙！', '나!다.'], ['后锚', '뒤'],
+            ['1、已命中\n2、新拆', '1. 다른 번역\n2. =새'], ['已命中', '整句译文'],
+            ['留一\n缺一', '부분1\n부분2'], ['独甲\n独乙', '단독1\n단독2'], ['留一', None],
+        ])
+        baseline = self.workbook(self.baseline, [
+            ['说明'], [None], ['Key', 'Text', 'TextTrans'],
+            *[[str(i), text, '已有译文'] for i, text in enumerate(
+                ['前锚', '\n甲…乙！\n', '后锚', '已命中', '新拆', '留一', '独甲', '独乙'])],
+        ])
+        hashes = {p: hashlib.sha256(p.read_bytes()).digest() for p in (source, baseline)}
+        result, _ = self.scan()
+        matched = result.match_report
+        self.assertEqual((matched.baseline_rows, matched.matched_rows, matched.recommended_rows), (8, 8, 8))
+        self.assertTrue(all(p.is_file() for p in matched.outputs))
+        book = load_workbook(matched.destination / '基准匹配结果/char.xlsx')
+        try:
+            sheet = book.active
+            headers = {c.value: c.column for c in sheet[3] if c.value}
+            for row, translation, status in [
+                (5, '\n가... 나! 다.\n', '合并推荐·待复核'),
+                (7, '整句译文', '唯一译文'), (8, '=새', '拆分推荐·待复核'),
+                (9, '부분1', '拆分推荐·待复核'), (10, '단독1', '拆分推荐·待复核'),
+                (11, '단독2', '拆分推荐·待复核'),
+            ]:
+                self.assertEqual(sheet.cell(row, headers['推荐韩语']).value, translation)
+                self.assertEqual(sheet.cell(row, headers['推荐状态']).value, status)
+                self.assertEqual(sheet.cell(row, headers['TextTrans']).value, '已有译文')
+            self.assertEqual(sheet.cell(8, headers['推荐韩语']).data_type, 's')
+            self.assertEqual(sheet.cell(9, headers['匹配条数']).value, 2)
+            self.assertEqual(sheet.cell(9, headers['缺译条数']).value, 1)
+            self.assertIn('句中省略号', sheet.cell(5, headers['推荐依据']).value)
+            self.assertIn('韩文字符', sheet.cell(8, headers['推荐依据']).value)
+        finally:
+            book.close()
+        book = load_workbook(matched.destination / '匹配明细.xlsx')
+        try:
+            structural = list(book['合并拆分推荐'].values)[1:]
+            self.assertEqual(len(structural), 5)
+            self.assertEqual({r[7] for r in structural}, {'合并推荐·待复核', '拆分推荐·待复核'})
+            pending = list(book['结构推荐未写入'].values)[1:]
+            self.assertEqual([(r[3], r[-1]) for r in pending], [('已命中', '保留已有整句推荐')])
+            unused = list(book['未推荐明细'].values)[1:]
+            self.assertEqual({r[4] for r in unused}, {'1、已命中\n2、新拆', '留一\n缺一', '留一'})
+            self.assertTrue(all(r[-1] == '拆分后仅部分分段获推荐，剩余分段待复核' for r in unused if '\n' in r[4]))
+            self.assertEqual(next(r[7] for r in unused if r[4] == '留一'), '是')
+            self.assertEqual(list(book['未匹配明细'].values)[1:], [])
+        finally:
+            book.close()
+        book = load_workbook(matched.destination / '基准文件匹配统计.xlsx')
+        try:
+            self.assertEqual(list(book['总体统计'].values)[1][2:6], (8, 8, 8, 8))
+        finally:
+            book.close()
+        self.assertEqual(hashes, {p: hashlib.sha256(p.read_bytes()).digest() for p in hashes})
+
+    def test_merge_split_competition_does_not_pick_an_arbitrary_translation(self):
+        self.workbook(self.source, [['台词', '한국어'], ['前锚', '앞'], ['甲', '가'], ['乙', '나'],
+                                   ['后锚', '뒤'], ['甲乙\n独立', '다른\n독립']])
+        self.workbook(self.baseline, [['Text'], ['前锚'], ['甲乙'], ['后锚'], ['独立']])
+        result, _ = self.scan()
+        self.assertEqual(result.match_report.recommended_rows, 3)
+        book = load_workbook(result.match_report.destination / '匹配明细.xlsx')
+        try:
+            pending = list(book['结构推荐未写入'].values)[1:]
+            self.assertEqual(len(pending), 2)
+            self.assertTrue(all('多个结构推荐' in r[-1] for r in pending))
+            unused = list(book['未推荐明细'].values)[1:]
+            self.assertTrue(all('结构候选未写入' in r[-1] for r in unused if r[4] in ('甲', '乙')))
+        finally:
+            book.close()
+        book = load_workbook(result.match_report.destination / '基准匹配结果/char.xlsx')
+        try:
+            self.assertIsNone(book.active['AD3'].value)
+        finally:
+            book.close()
+
+    def test_changed_source_between_structure_and_recommendations_aborts_output(self):
+        source = self.workbook(self.source, [['台词', '한국어'], ['甲\n乙', '가\n나']])
+        self.workbook(self.baseline, [['Text'], ['甲'], ['乙']])
+        def change_and_match(*args, **kwargs):
+            book = load_workbook(source)
+            book.active['B2'] = '새가\n새나'
+            book.save(source)
+            book.close()
+            return match_folder(*args, **kwargs)
+        with patch('structure_scan.match_folder', side_effect=change_and_match):
+            with self.assertRaisesRegex(ValueError, '源内容或参与范围已变化'):
+                self.scan()
+        self.assertEqual(list(self.output.iterdir()), [])
 
     def test_trial_report_unique_mapping_conflicts_and_formula_like_translation(self):
         source = self.workbook(self.source, [

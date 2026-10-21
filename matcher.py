@@ -709,13 +709,18 @@ def write_matching_details(destination, connection, progress=None):
         write_detail_sheet(book, title, ["源文件名","源完整路径","源 Sheet","源行号","源中文","韩语","命中基准","缺译","非空韩语种类数"],
                            rows, [35,65,25,16,55,55,16,12,24], progress)
     records = connection.execute("""
+        WITH recommended_pairs AS (
+            SELECT DISTINCT chosen.text,chosen.korean_key
+            FROM recommendations r JOIN source_rows chosen ON chosen.rowid=r.source_id
+        )
         SELECT s.path,s.sheet,s.row,s.chinese,s.korean,
                CASE WHEN t.source_id IS NOT NULL THEN '是' ELSE '否' END,
                CASE WHEN s.korean_key='' THEN '是' ELSE '否' END,
                CASE WHEN t.source_id IS NULL THEN '基准文件中找不到'
                     ELSE '基准文件中找到了但不符合推荐规则' END
         FROM source_rows s LEFT JOIN matched_sources t ON t.source_id=s.rowid
-        WHERE NOT EXISTS (SELECT 1 FROM recommendations r WHERE r.source_id=s.rowid)
+        WHERE NOT EXISTS (SELECT 1 FROM recommended_pairs r
+                          WHERE r.text=s.text AND r.korean_key=s.korean_key)
         ORDER BY s.rowid
     """)
     rows = ([Path(p).name,p,sheet,row,cn,ko,matched,missing,reason]

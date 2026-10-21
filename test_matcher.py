@@ -763,14 +763,14 @@ class TranslationMatches(unittest.TestCase):
         records = list(sheet.values)
         self.assertEqual(records[0], ('源文件名','源完整路径','源 Sheet','源行号','源中文','韩语','命中基准','缺译','未推荐原因'))
         rows = {(r[0], r[3]): r for r in records[1:]}
-        self.assertEqual(set(rows), {('A.xlsx', i) for i in range(3, 9)} | {('B.xlsx', 2), ('B.xlsx', 3)})
+        self.assertEqual(set(rows), {('A.xlsx', i) for i in range(4, 9)} | {('B.xlsx', 2), ('B.xlsx', 3)})
         self.assertEqual(len(records) - 1, len(rows))
         for key, row in rows.items():
             unmatched = key in {('A.xlsx', 7), ('A.xlsx', 8)}
             self.assertEqual(row[6], '否' if unmatched else '是')
             self.assertEqual(row[8], '基准文件中找不到' if unmatched else '基准文件中找到了但不符合推荐规则')
             self.assertEqual(row[2], '正文')
-        self.assertEqual(rows['A.xlsx', 3][4], ' 唯一 ')
+        self.assertNotIn(('A.xlsx', 3), rows)
         self.assertEqual(rows['A.xlsx', 7][5], ' 원문\n')
         self.assertEqual(rows['A.xlsx', 4][7], '是')
         self.assertEqual(rows['B.xlsx', 3][5:8], (' \t ', '是', '是'))
@@ -778,8 +778,37 @@ class TranslationMatches(unittest.TestCase):
         self.assertEqual(sheet.cell(formula_row, 5).data_type, 's')
         self.assertEqual(sheet.cell(formula_row, 6).data_type, 's')
         self.assertEqual(sheet.freeze_panes, 'A2')
-        self.assertEqual(sheet.auto_filter.ref, 'A1:I9')
+        self.assertEqual(sheet.auto_filter.ref, 'A1:I8')
         book.close()
+
+    def test_unrecommended_details_exclude_recommended_pairs_across_files_and_rounds(self):
+        first = self.write_source([
+            ['已推荐', '번역'], [' 已推荐 \n', '\n번역 '],
+            ['<b>补匹配</b>', '보충'], ['尾注（说明）', '주석'],
+            ['未匹配', '미사용'], ['未匹配', '미사용'],
+        ], name='A.xlsx')
+        second = self.write_source([
+            ['已推荐', '번역'], ['<b>补匹配</b>', '보충'], ['尾注（说明）', '주석'],
+            ['别的原文', '번역'], ['<b>已推荐</b>', '번역'],
+        ], name='B.xlsx', title='重复来源')
+        baseline = self.write_baseline(['已推荐', '补匹配', '尾注'])
+        hashes = {p: hashlib.sha256(p.read_bytes()).digest() for p in (first, second, baseline)}
+        result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
+        self.assertEqual((result.source_rows, result.source_matched, result.recommended_rows, result.match_pairs),
+                         (11, 7, 3, 7))
+        book = load_workbook(result.destination / '匹配明细.xlsx')
+        unused = list(book['未推荐明细'].values)[1:]
+        self.assertEqual([(r[0], r[3], r[4]) for r in unused], [
+            ('A.xlsx', 6, '未匹配'), ('A.xlsx', 7, '未匹配'),
+            ('B.xlsx', 5, '别的原文'), ('B.xlsx', 6, '<b>已推荐</b>'),
+        ])
+        # All candidates and their actual selected positions remain traceable.
+        matches = list(book['匹配明细'].values)[1:]
+        self.assertEqual(len(matches), 7)
+        self.assertEqual(sum(r[20] == '是' for r in matches), 3)
+        self.assertEqual({r[23] for r in matches}, {'全文精确匹配', '纯文本补匹配', TAIL_MATCH})
+        book.close()
+        self.assertEqual(hashes, {p: hashlib.sha256(p.read_bytes()).digest() for p in hashes})
 
     def test_unrecommended_details_empty_still_has_headers(self):
         self.write_source([['中文', '번역']])

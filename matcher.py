@@ -31,7 +31,8 @@ def match_key(value):
     return value.strip() if isinstance(value, str) else ""
 
 
-PLAIN_REVIEW_NOTE = "仅纯文本匹配，仍需复核标签"
+PLAIN_REVIEW_NOTE = "仅纯文本匹配，仍需复核标签；比较时忽略指定标点差异（…/...、，/,、；/;、：/:）"
+PLAIN_PUNCTUATION = str.maketrans({"…": "...", "，": ",", "；": ";", "：": ":"})
 TAIL_MATCH = "句尾去括号补匹配"
 FUZZY_MATCH = "模糊匹配"
 FUZZY_MIN_PERCENT = 80
@@ -49,7 +50,7 @@ RECOMMENDED_PAIRS = """
 
 
 def plain_key(value):
-    return CODE_TAGS.sub("", TEXT_TAG.sub("", match_key(value))).strip()
+    return CODE_TAGS.sub("", TEXT_TAG.sub("", match_key(value))).strip().translate(PLAIN_PUNCTUATION)
 
 
 def source_metadata_columns(header):
@@ -795,7 +796,7 @@ def apply_fuzzy_recommendations(connection, progress=None):
                 reason = "采用最高相似度的非空译文；同分同译取读取顺序首条"
                 recommended += 1
         basis = (f"模糊匹配，相似度 {highest:.1%}（最低 {FUZZY_MIN_PERCENT}%）；{reason}；"
-                 "按去标签及换行后的中文字符顺序比较；仍需复核文字差异、语义及标签")
+                 "按去标签及换行、统一指定标点后的中文字符顺序比较；仍需复核文字差异、语义及标签")
         connection.execute("UPDATE recommendations SET source_id=?,basis=?,status=?,match_type=? WHERE path=? AND sheet=? AND row=?",
                            (source_id, basis, status, FUZZY_MATCH, *key))
         connection.execute("INSERT INTO baseline_counts VALUES (?,?,?,?,?,?)", (*key, n, missing, variants))

@@ -893,7 +893,7 @@ class Application:
                                    f"试拆分 {value.trial_groups} 组 / {value.trial_segments} 条；暂不拆分 {value.trial_pending} 个源行。\n"
                                    f"已生成综合推荐：匹配 {value.match_report.matched_rows} 行，推荐 {value.match_report.recommended_rows} 行。\n"
                                    f"结果位置：{value.destination}\n"
-                                   "点击“打开结果文件夹”查看基准副本；按推荐状态筛选合并、拆分或模糊推荐，均需复核。\n"
+                                   "点击“打开结果文件夹”查看基准副本；可筛选“合并推荐·待复核”“拆分推荐·待复核”“模糊推荐·待复核”。\n"
                                    "试合并中的“复核填写”可保存后选择重跑；复核自动保存，内容变化后需重审。")
                         self.match_summary.set(summary)
                         self.status.set(summary.split("\n")[0])

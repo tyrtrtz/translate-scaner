@@ -181,6 +181,8 @@ class DesktopWorkflow(unittest.TestCase):
             self.assertIs(app.match_report, app.structure_report.match_report)
             self.assertEqual(app.match_report.destination, app.structure_report.destination / '推荐结果')
             self.assertIn('合并推荐·待复核', app.match_summary.get())
+            self.assertIn('拆分推荐·待复核', app.match_summary.get())
+            self.assertIn('模糊推荐·待复核', app.match_summary.get())
             with patch('app.open_path') as opened:
                 app.match_details_button.invoke()
                 opened.assert_called_once_with(app.match_report.destination / '匹配明细.xlsx')

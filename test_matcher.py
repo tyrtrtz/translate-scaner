@@ -79,7 +79,7 @@ class TranslationMatches(unittest.TestCase):
         sheet = book.active
         self.assertEqual((sheet['AD2'].value, sheet['AG2'].value), ('=추천', '模糊推荐·待复核'))
         self.assertEqual(sheet['AD2'].data_type, 's')
-        score = SequenceMatcher(None, target, repeated, autojunk=False).ratio()
+        score = SequenceMatcher(None, plain_key(target), plain_key(repeated), autojunk=False).ratio()
         self.assertIn(f'{score:.1%}', sheet['AF2'].value)
         self.assertEqual(sheet['AA2'].value, 3)
         self.assertEqual(sheet['AC2'].value, '是')  # Lower-scoring variants remain visible.
@@ -112,6 +112,45 @@ class TranslationMatches(unittest.TestCase):
         total = list(book['总体统计'].values)[1]
         self.assertEqual(total[2:11], (8, 6, 5, 3, 2, 1, 4, 2, 2))
         book.close()
+        self.assertEqual(hashes, {p: hashlib.sha256(p.read_bytes()).digest() for p in hashes})
+
+    def test_plain_punctuation_pairs_match_before_fuzzy_and_preserve_originals(self):
+        pairs = [('这是奇波呀…', '这是奇波呀...'), ('甲，乙', '甲,乙'),
+                 ('丙;丁', '丙；丁'), ('戊：己', '戊:己')]
+        rows, targets = [], []
+        for index, (left, right) in enumerate(pairs):
+            for prefix, source, target in (('正', left, right), ('反', right, left)):
+                rows.append([f'<color=red>{prefix}{source}</color>', f'<b>{prefix}译文{index}</b>'])
+                targets.append('{playername}' + prefix + target)
+        rows += [['同译；原文', '相同译文'], ['同译;原文', '相同译文'],
+                 ['精确：优先', '精确译文'], ['精确:优先', '补匹配不能覆盖']]
+        targets += ['冲突,原文…', '<b>同译;原文</b>', '精确：优先']
+        source, baseline = self.write_source(rows), self.write_baseline(targets)
+        conflict = self.write_source([['冲突，原文…', '冲突译文甲'], ['冲突,原文...', '冲突译文乙']], name='冲突.xlsx')
+        hashes = {p: hashlib.sha256(p.read_bytes()).digest() for p in (source, baseline, conflict)}
+        result = match_folder(scan_folder(self.source), self.baseline, self.output)
+        book = load_workbook(result.destination / '基准匹配结果/story.xlsx')
+        try:
+            for row in range(2, 10):
+                self.assertEqual(book.active.cell(row, 30).value, rows[row-2][1])
+                self.assertEqual(book.active.cell(row, 33).value, '唯一译文')
+                self.assertIn('忽略指定标点差异', book.active.cell(row, 32).value)
+            self.assertEqual((book.active['AG10'].value, book.active['AD10'].value), ('待确认', None))
+            self.assertEqual((book.active['AG11'].value, book.active['AD11'].value), ('唯一译文', '相同译文'))
+            self.assertEqual(book.active['AD12'].value, '精确译文')
+        finally:
+            book.close()
+        book = load_workbook(result.destination / '匹配明细.xlsx')
+        try:
+            details = list(book['匹配明细'].values)[1:]
+            self.assertTrue(all(r[23] == '纯文本补匹配' and r[28] is None for r in details if r[3] <= 11))
+            self.assertEqual({r[8] for r in details if r[3] <= 9}, {r[0] for r in rows[:8]})
+        finally:
+            book.close()
+        # Only the four requested groups are equivalent, not every width variant.
+        self.assertEqual(plain_key('……，；：'), '......,;:')
+        for left, right in [('！', '!'), ('？', '?'), ('。', '.'), ('Ａ', 'A'), ('１', '1'), ('…', '......')]:
+            self.assertNotEqual(plain_key(left), plain_key(right))
         self.assertEqual(hashes, {p: hashlib.sha256(p.read_bytes()).digest() for p in hashes})
 
     def test_fuzzy_index_matches_exhaustive_scoring_including_threshold_and_repeated_text(self):
@@ -605,7 +644,7 @@ class TranslationMatches(unittest.TestCase):
         book.close()
         self.assertEqual(before, {p: hashlib.sha256(p.read_bytes()).digest() for p in before})
         self.assertEqual(plain_key('{playername}<color=#3266b4>你好</color>\\n\r\n世界'), '你好世界')
-        self.assertEqual(plain_key('价格100，OK < 200'), '价格100，OK < 200')
+        self.assertEqual(plain_key('价格100，OK < 200'), '价格100,OK < 200')
         self.assertEqual(plain_key('{name}<color=red></color>\\n'), '')
         included = match_folder(scan_folder(self.source, 1, include_deprecated=True), self.baseline, self.output)
         self.assertEqual((included.matched_rows,included.recommended_rows), (5,5))

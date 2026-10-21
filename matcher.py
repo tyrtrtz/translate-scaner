@@ -29,6 +29,7 @@ def match_key(value):
 
 
 PLAIN_REVIEW_NOTE = "仅纯文本匹配，仍需复核标签"
+TAIL_MATCH = "句尾去括号补匹配"
 CONTEXT_SKIP_NOTES = {"演出", "气息"}
 TEXT_TAG = re.compile(r"</?[A-Za-z][^<>\r\n]*>")
 CODE_TAGS = re.compile(r"\{[^{}\r\n]*\}|\\[nr]|[\r\n]")
@@ -76,6 +77,37 @@ def breath_key(value):
         elif not stack:
             result.append(char)
     return text if stack else "".join(result).strip()
+
+
+def trailing_note_key(value):
+    """Remove only balanced parenthetical groups at the end; keep malformed text."""
+    text = match_key(value)
+    end = len(text)
+    pairs = {")": "(", "）": "（"}
+    stack = []
+    for char in text:
+        if char in ("(", "（"):
+            stack.append(char)
+        elif char in pairs and (not stack or stack.pop() != pairs[char]):
+            return text
+    if stack:
+        return text
+    while end and text[end - 1] in pairs:
+        stack, start = [], None
+        for index in range(end - 1, -1, -1):
+            char = text[index]
+            if char in pairs:
+                stack.append(pairs[char])
+            elif char in ("(", "（"):
+                if not stack or stack.pop() != char:
+                    return text
+                if not stack:
+                    start = index
+                    break
+        if start is None:
+            return text
+        end = len(text[:start].rstrip())
+    return text[:end]
 
 
 def boundary_newlines(value):
@@ -450,15 +482,30 @@ def build_recommendations(connection, progress=None):
         previous, following = read_context(connection, "source_context_rows", path, sheet, sequence)
         connection.execute("INSERT INTO source_context (source_id,previous,following) VALUES (?,?,?)",
                            (source_id, json.dumps(previous, ensure_ascii=False), json.dumps(following, ensure_ascii=False)))
-    for plain in (False, True):
+    for round_type in ("全文精确匹配", "纯文本补匹配", TAIL_MATCH):
+        tail = round_type == TAIL_MATCH
+        plain = round_type != "全文精确匹配"
+        if tail:
+            connection.execute("CREATE TEMP TABLE tail_sources (source_id INTEGER PRIMARY KEY,text TEXT)")
+            for source_id, text in connection.execute("""SELECT rowid,plain_text FROM source_rows s
+                WHERE NOT EXISTS (SELECT 1 FROM comparisons c WHERE c.source_id=s.rowid)"""):
+                key = trailing_note_key(text)
+                if key and key != text:
+                    connection.execute("INSERT INTO tail_sources VALUES (?,?)", (source_id, key))
+            connection.execute("CREATE INDEX tail_text ON tail_sources(text)")
         column = "plain_text" if plain else "text"
         condition = """WHERE b.plain_text!='' AND NOT EXISTS
             (SELECT 1 FROM recommendations r WHERE r.path=b.path AND r.sheet=b.sheet AND r.row=b.row AND r.source_id IS NOT NULL)""" if plain else ""
+        if tail:
+            condition = "WHERE b.plain_text!='' AND EXISTS (SELECT 1 FROM tail_sources t WHERE t.text=b.plain_text)"
         if progress:
-            progress("忽略标签补匹配并比较上下文……" if plain else "比较中文全文匹配的上下文……")
+            progress("比较" + round_type + "的上下文……")
         records = connection.execute(f"SELECT b.path,b.sheet,b.row,b.{column},b.seq FROM baseline_rows b {condition} ORDER BY b.path,b.sheet,b.row")
         for index, (path, sheet, row, text, sequence) in enumerate(records, 1):
-            match_type = "纯文本补匹配" if plain else "全文精确匹配"
+            match_type = round_type
+            previous_recommendation = connection.execute(
+                "SELECT source_id,basis,status,match_type FROM recommendations WHERE path=? AND sheet=? AND row=?",
+                (path, sheet, row)).fetchone() if tail else None
             previous, following = read_context(connection, "baseline_rows", path, sheet, sequence, plain)
             breath_text = breath_key(text)
             if plain:
@@ -471,10 +518,15 @@ def build_recommendations(connection, progress=None):
             best_previous = best_following = 0
             column = "plain_text" if plain else "text"
             breath_column = "breath_plain" if plain else "breath_text"
+            candidate_condition = f"{column}=? OR ({breath_column}!='' AND {breath_column}=?)"
+            arguments = (text, breath_text)
+            if tail:
+                candidate_condition = "rowid IN (SELECT source_id FROM tail_sources WHERE text=?)"
+                arguments = (text,)
             candidates = connection.execute(f"""
                 SELECT rowid,korean_key,path,sheet,seq,{column} FROM source_rows
-                WHERE {column}=? OR ({breath_column}!='' AND {breath_column}=?) ORDER BY rowid
-            """, (text, breath_text))
+                WHERE {candidate_condition} ORDER BY rowid
+            """, arguments)
             for source_id, korean_key, source_path, source_sheet, source_sequence, source_text in candidates:
                 candidate_type = "气息去括号匹配" if not plain and source_text != text else match_type
                 context = connection.execute("SELECT previous,following FROM source_context WHERE source_id=?", (source_id,)).fetchone()
@@ -508,6 +560,29 @@ def build_recommendations(connection, progress=None):
                     best_previous, best_following = pe, fe
                 elif score == best_score and korean_key != best_key:
                     tied = True
+            if tail and previous_recommendation and previous_recommendation[0] is not None:
+                connection.execute("UPDATE recommendations SET basis=? WHERE path=? AND sheet=? AND row=?",
+                    ("保留先前匹配阶段推荐：" + previous_recommendation[1] + "；新增句尾去括号来源仅供复核", path, sheet, row))
+                continue
+            if tail:
+                # New candidates must compete with every already-found source, not hide conflicts.
+                count = connection.execute("""SELECT COUNT(*),SUM(s.korean_key=''),
+                    COUNT(DISTINCT NULLIF(s.korean_key,'')) FROM comparisons c
+                    JOIN source_rows s ON s.rowid=c.source_id WHERE c.path=? AND c.sheet=? AND c.row=?""",
+                    (path, sheet, row)).fetchone()
+                best_score, best_id, best_key, tied = (-1, -1), None, None, False
+                for source_id, korean_key, pe, fe, full, candidate_type in connection.execute("""
+                    SELECT s.rowid,s.korean_key,c.previous_equal,c.following_equal,c.full_sides,c.match_type
+                    FROM comparisons c JOIN source_rows s ON s.rowid=c.source_id
+                    WHERE c.path=? AND c.sheet=? AND c.row=? ORDER BY s.rowid""", (path, sheet, row)):
+                    if not korean_key:
+                        continue
+                    score = (full, pe + fe)
+                    if score > best_score:
+                        best_score, best_id, best_key, tied = score, source_id, korean_key, False
+                        best_previous, best_following, match_type = pe, fe, candidate_type
+                    elif score == best_score and korean_key != best_key:
+                        tied = True
             if count is None or count[0] == 0:
                 status, basis, best_id = "未匹配", "没有忽略标签后正文一致的源行" if plain else "没有中文全文匹配的源行", None
             elif count[2] == 0:
@@ -528,7 +603,11 @@ def build_recommendations(connection, progress=None):
                     basis += "；气息台词忽略括号说明（原文保留）"
                     if not plain:
                         match_type = "气息去括号匹配"
-            if plain:
+            if tail:
+                basis = "句尾去括号补查后综合候选；" + basis
+                if best_id is not None and match_type == TAIL_MATCH:
+                    basis = "忽略源中文句尾括号说明后匹配，仍需复核；" + PLAIN_REVIEW_NOTE + "；" + basis
+            elif plain:
                 basis = (PLAIN_REVIEW_NOTE + "；" if best_id is not None else "纯文本补匹配未能推荐；") + basis
             connection.execute("INSERT OR REPLACE INTO recommendations VALUES (?,?,?,?,?,?,?)", (path, sheet, row, best_id, basis, status, match_type))
             if progress and index % 5000 == 0:

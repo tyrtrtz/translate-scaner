@@ -10,7 +10,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
 
 from ignored_sheets import sheet_key
-from matcher import align_boundary_newlines, breath_key, match_folder, plain_key, write_detail_sheet
+from matcher import TAIL_MATCH, align_boundary_newlines, breath_key, match_folder, plain_key, trailing_note_key, write_detail_sheet
 from scanner import scan_folder
 
 
@@ -514,6 +514,41 @@ class TranslationMatches(unittest.TestCase):
         self.assertEqual({r[0]:r[23] for r in rows}, {'A.xlsx':'全文精确匹配','B.xlsx':'纯文本补匹配'})
         self.assertEqual(list(book['未推荐明细'].values)[1:], [])
         book.close()
+
+    def test_trailing_notes_only_retry_unused_sources_preserve_recommendations_and_conflicts(self):
+        source = self.write_source([
+            ['保持', '기존'], ['保持（新说明）', '다른'],
+            ['<color=red>你好</color>（小声）(动作)', '안녕 (작게)'],
+            ['中（注）间', '중'], ['完整（备注）', 'full'], ['缺译（说明）', None],
+            ['冲突（甲）', '번역1'], ['冲突（乙）', '번역2'],
+        ])
+        first = self.write_baseline(['保持', '你好', '中间', '完整（备注）', '完整', '缺译', '冲突'])
+        second = self.write_baseline(['你好'], 'B.xlsx')
+        hashes = {p: hashlib.sha256(p.read_bytes()).digest() for p in (source, first, second)}
+        result = match_folder(scan_folder(self.source), self.baseline, self.output)
+        self.assertEqual((result.baseline_rows, result.matched_rows, result.recommended_rows,
+                          result.source_matched, result.match_pairs), (8, 6, 4, 7, 8))
+        book = load_workbook(result.destination / '基准匹配结果/story.xlsx')
+        self.assertEqual(book.active['AD2'].value, '기존')
+        self.assertIn('保留先前匹配阶段推荐', book.active['AF2'].value)
+        self.assertEqual(book.active['AD3'].value, '안녕 (작게)')
+        self.assertIn('忽略源中文句尾括号', book.active['AF3'].value)
+        self.assertIn('仍需复核标签', book.active['AF3'].value)
+        self.assertEqual(book.active['AG7'].value, '全部缺译')
+        self.assertEqual(book.active['AG8'].value, '待确认')
+        book.close()
+        book = load_workbook(result.destination / '匹配明细.xlsx')
+        rows = list(book['匹配明细'].values)[1:]
+        self.assertEqual(sum(r[23] == TAIL_MATCH for r in rows), 6)
+        unused = {r[4]: r[-1] for r in list(book['未推荐明细'].values)[1:]}
+        self.assertIn('找到了但不符合推荐规则', unused['保持（新说明）'])
+        self.assertIn('找不到', unused['中（注）间'])
+        book.close()
+        self.assertEqual(hashes, {p: hashlib.sha256(p.read_bytes()).digest() for p in hashes})
+        for original, expected in [('甲（乙(丙)）', '甲'), ('甲（乙）丁', '甲（乙）丁'),
+                                   ('甲（乙)', '甲（乙)'), ('甲（未闭合(注)', '甲（未闭合(注)'),
+                                   ('甲）乙（注）', '甲）乙（注）'), ('（说明）', '')]:
+            self.assertEqual(trailing_note_key(original), expected)
 
     def test_plain_context_resolves_exact_conflict_and_skips_tag_only_neighbors(self):
         a = ['<b>前1</b>','{name}','<b>前2</b>','<b>前3</b>','争议',

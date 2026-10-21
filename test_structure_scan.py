@@ -11,7 +11,7 @@ from openpyxl import Workbook, load_workbook
 from ignored_sheets import sheet_key
 from matcher import match_folder
 from scanner import scan_folder
-from structure_scan import bilingual_evidence, comparison_key, scan_structure, split_patterns, trial_merge, trial_numbered_split
+from structure_scan import bilingual_evidence, comparison_key, scan_structure, split_patterns, split_translation, trial_merge, trial_numbered_split
 
 
 class StructureScanTests(unittest.TestCase):
@@ -440,17 +440,18 @@ class StructureScanTests(unittest.TestCase):
         ])
         hashes = [hashlib.sha256(p.read_bytes()).digest() for p in (source, baseline)]
         result, _ = self.scan()
-        self.assertEqual((result.trial_groups, result.trial_segments, result.trial_pending), (1, 2, 5))
+        self.assertEqual((result.trial_groups, result.trial_segments, result.trial_pending), (2, 4, 4))
         book = load_workbook(result.destination / "试拆分结果.xlsx")
         self.addCleanup(book.close)
         rows = list(book["拆分明细"].values)
-        self.assertEqual([row[2:5] for row in rows[1:]], [("甲", "=literal", "甲"), ("乙", "나", "乙")])
-        self.assertEqual([row[8] for row in rows[1:]], [2, 3])
-        self.assertTrue(all(row[11] == 2 for row in rows[1:]))
+        self.assertEqual([row[2:5] for row in rows[1:]],
+                         [("甲", "=literal", "甲"), ("乙", "나", "乙"), ("庚", "사", "庚"), ("辛", "아", "辛")])
+        self.assertEqual([row[8] for row in rows[1:]], [2, 3, 14, 15])
+        self.assertEqual([row[11] for row in rows[1:]], [2, 2, 6, 6])
         self.assertEqual(book["拆分明细"]["D2"].data_type, "s")
         self.assertEqual(book["整组原文"]["B2"].value, "1、甲\n2、乙")
         reasons = [row[3] for row in list(book["暂不拆分"].values)[1:]]
-        for expected in ("归属不唯一", "来源冲突", "数字编号", "没有对应"):
+        for expected in ("归属不唯一", "来源冲突", "没有对应"):
             self.assertTrue(any(expected in reason for reason in reasons), expected)
         self.assertEqual(hashes, [hashlib.sha256(p.read_bytes()).digest() for p in (source, baseline)])
 
@@ -471,6 +472,56 @@ class StructureScanTests(unittest.TestCase):
         result, sheets = self.scan(max_rows=3, include_hidden_rows=False)
         self.assertEqual(result.merge_candidates, 1)
         self.assertIn("长一", sheets["合并候选"][1][5])
+
+    def test_added_number_separators_and_line_split_validation(self):
+        for separator in (";", "；", ",", "，", "、"):
+            with self.subTest(separator=separator):
+                patterns, reason = trial_numbered_split(f"1{separator}甲\n2{separator}乙", "1. 가\n2. 나", ['甲', '乙'])
+                self.assertEqual(reason, '')
+                self.assertEqual([p.strip() for p in patterns[0]['parts']], ['甲', '乙'])
+        self.assertFalse(split_patterns('价格1,234与2,345；小数1.23与2.34'))
+        for chinese, korean, expected in [
+            ('甲\n乙', '가', '韩文没有'), ('甲\n乙', '가\n나\n다', '段数不一致'),
+            ('甲\n\n乙', '가\n\n나', '空分段'), ('甲\n乙', '2.가\n3.나', '歧义'),
+            ('甲{name}\n乙', '가\n나', '占位符'),
+            ('<color=red>甲\n乙</color>', '가\n나', '标签'),
+        ]:
+            with self.subTest(chinese=chinese, korean=korean):
+                patterns, reason = split_translation(chinese, korean)
+                self.assertIsNone(patterns)
+                self.assertIn(expected, reason)
+
+    def test_partial_line_preview_keeps_numbered_korean_positions_and_reports_remaining(self):
+        source = self.workbook(self.source, [['台词', '한국어'], ['\n甲\\n未找到\n丙\n', '\n1. 가\n2. 나\\n3. 다\n']])
+        baseline = self.workbook(self.baseline, [['Text', 'TextTrans'], ['甲', '原译文'], ['丙', '原译文']])
+        hashes = {p: hashlib.sha256(p.read_bytes()).digest() for p in (source, baseline)}
+        result, sheets = self.scan()
+        self.assertEqual((result.trial_groups, result.trial_segments, result.trial_pending), (1, 2, 1))
+        book = load_workbook(result.destination / '试拆分结果.xlsx')
+        rows = list(book['拆分明细'].values)[1:]
+        self.assertEqual([(r[1], r[2], r[3], r[8], r[-1]) for r in rows],
+                         [('1', '甲', '1. 가', 2, '2/3段'), ('3', '丙', '3. 다', 3, '2/3段')])
+        missing = list(book['分段未匹配'].values)[1:]
+        self.assertEqual([r[1:4] for r in missing], [(2, '未找到', '2. 나')])
+        self.assertIn('没有对应', missing[0][4])
+        self.assertEqual(book['整组原文']['D2'].value, 3)
+        book.close()
+        unresolved = sheets['未解释'][1:]
+        self.assertEqual(len(unresolved), 1)
+        self.assertIn('已定位2/3段', unresolved[0][-1])
+        self.assertEqual(hashes, {p: hashlib.sha256(p.read_bytes()).digest() for p in hashes})
+
+    def test_trailing_whole_matches_prevent_false_merge_and_unresolved(self):
+        self.workbook(self.source, [['台词', '한국어'], ['你好（小声）', '안녕 (작게)'], ['你', '너'], ['好', '좋아'],
+                                   ['完整（注）', 'full'], ['中（注）间', '중']])
+        self.workbook(self.baseline, [['Text'], ['你好'], ['完整（注）'], ['完整'], ['中间']])
+        result, sheets = self.scan()
+        self.assertEqual(result.whole_matched_rows, 2)
+        self.assertEqual(result.merge_candidates, 0)
+        self.assertNotIn('你好（小声）', [r[5] for r in sheets['未解释'][1:]])
+        self.assertIn('完整', [r[5] for r in sheets['未解释'][1:]])
+        matched = match_folder(scan_folder(self.source), self.baseline, self.output)
+        self.assertEqual(matched.matched_rows, result.whole_matched_rows)
 
     def test_duplicate_candidates_and_misaligned_segment_boundaries_remain_visible(self):
         self.workbook(self.source, [["台词", "한국어"], ["甲", "가"], ["乙", "나"]])

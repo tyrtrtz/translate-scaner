@@ -18,7 +18,8 @@ from openpyxl import Workbook, load_workbook
 
 from ignored_sheets import load_ignored, write_json
 from merge_reviews import apply_review_file, candidate_identity, load_reviews
-from matcher import (TEXT_TAG, baseline_sheets, breath_key, match_key, plain_key, prepare_inputs,
+from matcher import (TAIL_MATCH, TEXT_TAG, baseline_sheets, breath_key, match_key, plain_key, prepare_inputs,
+                     trailing_note_key,
                      source_metadata_columns, source_row_metadata, write_detail_sheet)
 from scanner import hidden_row_numbers, normalize, scan_folder
 
@@ -26,8 +27,8 @@ from scanner import hidden_row_numbers, normalize, scan_folder
 LINE_BREAK = re.compile(r"\r\n|\r|\n|\\r\\n|\\[nr]")
 DISPLAY_TAG = re.compile(r"</?(?:color|ruby)(?:\s*=[^<>]*|\s+[^<>]*)?>", re.I)
 MARKER = re.compile(
-    r"(?<![A-Za-zＡ-Ｚａ-ｚ0-9０-９_%{])"
-    r"(?:(?P<plain>[A-Za-zＡ-Ｚａ-ｚ]|[0-9０-９]{1,3})[.．:：、)）]"
+    r"(?:(?<![A-Za-zＡ-Ｚａ-ｚ0-9０-９_%{])|(?<=\\n)|(?<=\\r))"
+    r"(?:(?P<plain>[A-Za-zＡ-Ｚａ-ｚ]|[0-9０-９]{1,3})[.．:：、,，;；)）]"
     r"|[(（](?P<bracket>[A-Za-zＡ-Ｚａ-ｚ]|[0-9０-９]{1,3})[)）])"
 )
 SCENE_HEADERS = {"场景", "场景名", "场景编号"}
@@ -50,12 +51,16 @@ def comparison_key(text):
     return LINE_BREAK.sub("", TEXT_TAG.sub("", text)).strip()
 
 
+def trim_segment(text):
+    return re.sub(r"^(?:\s|\\[nr])+|(?:\s|\\[nr])+$", "", text)
+
+
 def split_patterns(text):
     """Return hypotheses with raw boundaries; none is an approved split rule."""
     result = []
     markers = [
         m for m in MARKER.finditer(text)
-        if not (m.group().endswith((".", "．")) and text[m.end():m.end() + 1].isdigit())
+        if not (m.group().endswith((".", "．", ",", "，")) and text[m.end():m.end() + 1].isdigit())
     ]
     if len(markers) >= 2:
         labels = [unicodedata.normalize("NFKC", m.group("plain") or m.group("bracket")).upper()
@@ -66,7 +71,7 @@ def split_patterns(text):
         parts = [text[m.end():end] for m, end in zip(markers, ends)]
         prefix = text[:markers[0].start()]
         issues = []
-        if prefix.strip():
+        if trim_segment(prefix):
             issues.append("首个编号前有未归属文字")
         if len(set(labels)) != len(labels):
             issues.append("编号重复，可能包含多组选项")
@@ -78,7 +83,7 @@ def split_patterns(text):
                 issues.append("编号未从1或A连续排列")
         if any(not comparison_key(part) for part in parts):
             issues.append("存在空选项")
-        if any(LINE_BREAK.search(part.strip()) for part in parts):
+        if any(LINE_BREAK.search(trim_segment(part)) for part in parts):
             issues.append("选项内部含换行，需要确认其含义")
         result.append(dict(rule=rule, labels=labels, parts=parts, prefix=prefix,
                            separators=[m.group() for m in markers],
@@ -155,6 +160,8 @@ def create_index(db):
         CREATE TABLE whole_matches (
             record_id INTEGER PRIMARY KEY, match_type TEXT, candidates INTEGER, variants INTEGER);
         CREATE TABLE whole_matched_sources (record_id INTEGER PRIMARY KEY);
+        CREATE TABLE whole_match_pairs (baseline_id INTEGER,source_id INTEGER,PRIMARY KEY(baseline_id,source_id));
+        CREATE TABLE trial_coverage (source_id INTEGER PRIMARY KEY,matched INTEGER,total INTEGER);
         CREATE TABLE merge_targets (record_id INTEGER PRIMARY KEY);
     """)
 
@@ -327,7 +334,27 @@ def index_whole_matches(db, progress):
                            (baseline["id"], mode, count, variants))
                 db.execute(f"""INSERT OR IGNORE INTO whole_matched_sources
                     SELECT record_id FROM whole_source_keys WHERE {condition}""", arguments)
+                db.execute(f"""INSERT INTO whole_match_pairs
+                    SELECT ?,record_id FROM whole_source_keys WHERE {condition}""", (baseline["id"], *arguments))
                 break
+    db.execute("CREATE TEMP TABLE whole_tail_keys (source_id INTEGER PRIMARY KEY,text TEXT)")
+    for source in db.execute("""SELECT record_id,plain FROM whole_source_keys s WHERE NOT EXISTS
+        (SELECT 1 FROM whole_matched_sources w WHERE w.record_id=s.record_id)"""):
+        key = trailing_note_key(source["plain"])
+        if key and key != source["plain"]:
+            db.execute("INSERT INTO whole_tail_keys VALUES (?,?)", (source["record_id"], key))
+    db.execute("CREATE INDEX whole_tail_text ON whole_tail_keys(text)")
+    for baseline in db.execute("SELECT id,original FROM records WHERE kind='baseline'"):
+        matches = list(db.execute("SELECT source_id FROM whole_tail_keys WHERE text=?", (plain_key(baseline["original"]),)))
+        if not matches:
+            continue
+        db.executemany("INSERT OR IGNORE INTO whole_match_pairs VALUES (?,?)", [(baseline["id"], r[0]) for r in matches])
+        db.executemany("INSERT OR IGNORE INTO whole_matched_sources VALUES (?)", matches)
+        count, variants = db.execute("""SELECT COUNT(*),COUNT(DISTINCT NULLIF(s.korean,'')) FROM whole_match_pairs p
+            JOIN whole_source_keys s ON s.record_id=p.source_id WHERE p.baseline_id=?""", (baseline["id"],)).fetchone()
+        db.execute("""INSERT INTO whole_matches VALUES (?,?,?,?) ON CONFLICT(record_id) DO UPDATE
+            SET candidates=excluded.candidates,variants=excluded.variants""", (baseline["id"], TAIL_MATCH, count, variants))
+    db.execute("DROP TABLE whole_tail_keys")
     db.execute("DROP TABLE whole_source_keys")
     db.commit()
 
@@ -523,6 +550,9 @@ def unresolved_rows(db, max_rows):
             reason = f"比较文本超过 {MAX_CHARACTERS} 字符，未参与连续窗口匹配"
         if row["kind"] == "source" and split_patterns(row["original"]):
             reason += "；已发现格式候选，详见规则样本"
+            coverage = db.execute("SELECT matched,total FROM trial_coverage WHERE source_id=?", (row["id"],)).fetchone()
+            if coverage and coverage[0]:
+                reason += f"；试拆分已定位{coverage[0]}/{coverage[1]}段，剩余见分段未匹配"
         if row["kind"] == "baseline" and not is_merge_baseline(row["path"]):
             reason += "；本基准不在 char.xlsx 合并范围内，未执行合并反查"
         else:
@@ -716,6 +746,7 @@ def write_merge_trial_report(db, destination, max_rows, progress, assessments):
         ["整句精确命中", whole_counts.get("全文精确匹配", 0)],
         ["气息去括号命中", whole_counts.get("气息去括号匹配", 0)],
         ["仅纯文本命中", whole_counts.get("纯文本补匹配", 0)],
+        ["句尾去括号命中", whole_counts.get(TAIL_MATCH, 0)],
         ["进入合并反查的基准行", merge_targets],
         ["未命中整句但不在合并范围的基准行", baseline_rows - whole - merge_targets],
         ["反查找到候选的基准行", len(by_baseline)],
@@ -724,7 +755,7 @@ def write_merge_trial_report(db, destination, max_rows, progress, assessments):
         ["反查有候选但暂不采用的基准行", pending],
         ["全部候选不适用的基准行", rejected],
         ["反查仍无候选的基准行", merge_targets - len(by_baseline)],
-        ["流程", "先对全部基准检查整句匹配；仅基准文件名为char.xlsx（不区分大小写）且两轮均无中文候选的行反查连续源行"],
+        ["流程", "先对全部基准检查整句匹配；仅基准文件名为char.xlsx（不区分大小写）且所有整句阶段均无中文候选的行反查连续源行"],
         ["合并范围", "story.xlsx及其他基准不参与合并反查；未读取到char.xlsx正文时合并候选为零，不扩大到其他文件。分文件数量见合并范围表"],
         ["已知场景", "目前已确认样本来自角色必杀技分段台词；语音名及播放说明供核对，char.xlsx中的其他候选仍需定位或人工确认"],
         ["命中与推荐", "整句命中检查不代替正式匹配的上下文推荐；有中文候选但缺译或冲突的行不算未匹配，不用合并覆盖"],
@@ -742,21 +773,35 @@ def write_merge_trial_report(db, destination, max_rows, progress, assessments):
     return whole, len(accepted), pending, rejected
 
 
-def trial_numbered_split(chinese, korean, baseline_texts):
-    """V1: numeric options only; return raw boundaries and a refusal reason."""
+def split_translation(chinese, korean):
+    """Use numbered options first, otherwise keep newline-delimited Korean verbatim."""
     patterns = []
+    cn_patterns = split_patterns(chinese)
+    numbered = any(p["labels"] for p in cn_patterns)
     for language, text in (("中文", chinese), ("韩文", korean)):
-        pattern = next((p for p in split_patterns(text) if p["rule"] == "数字编号"), None)
+        pattern = next((p for p in split_patterns(text)
+                        if (p["rule"] == "数字编号" if numbered else "换行" in p["rule"])), None)
         if pattern is None:
-            return None, f"{language}没有可用的数字编号；本版不按换行或中文长度分配译文"
+            return None, f"{language}没有可用的{'数字编号' if numbered else '数字编号或换行分段'}；不能可靠分配译文"
+        if not numbered:
+            # Ignore only blank cell edges; internal blank lines must not shift translations.
+            for edge in (0, -1):
+                while pattern["parts"] and not pattern["parts"][edge].strip():
+                    pattern["parts"].pop(edge)
+                    pattern["spans"].pop(edge)
+            pattern["issues"] = ["存在空分段"] if any(not comparison_key(p) for p in pattern["parts"]) else []
+            if len(pattern["parts"]) < 2:
+                return None, f"{language}不足两条有效换行分段"
         if pattern["issues"]:
             return None, f"{language}：" + "；".join(pattern["issues"])
         patterns.append(pattern)
     cn, ko = patterns
-    if cn["labels"] != ko["labels"]:
+    if cn["labels"] != ko["labels"] or len(cn["parts"]) != len(ko["parts"]):
         return None, "中韩编号、顺序或段数不一致"
-    if [comparison_key(p) for p in cn["parts"]] != [comparison_key(p) for p in baseline_texts]:
-        return None, "中文分段边界与基准未逐条一致"
+    if not numbered:
+        ko_numbered = next((p for p in split_patterns(korean) if p["labels"]), None)
+        if ko_numbered and (ko_numbered["issues"] or len(ko_numbered["parts"]) != len(cn["parts"])):
+            return None, "韩文编号或行边界有歧义；保留整组待复核"
     for index, (chinese_part, korean_part) in enumerate(zip(cn["parts"], ko["parts"]), 1):
         if Counter(PLACEHOLDER.findall(chinese_part)) != Counter(PLACEHOLDER.findall(korean_part)):
             return None, f"第{index}段中韩占位符不一致"
@@ -765,71 +810,113 @@ def trial_numbered_split(chinese, korean, baseline_texts):
     return patterns, ""
 
 
-def write_trial_report(db, destination, progress):
+def trial_numbered_split(chinese, korean, baseline_texts):
+    patterns, reason = split_translation(chinese, korean)
+    if patterns and [comparison_key(p) for p in patterns[0]["parts"]] != [comparison_key(p) for p in baseline_texts]:
+        return None, "中文分段边界与基准未逐条一致"
+    return patterns, reason
+
+
+def write_trial_report(db, destination, progress, max_rows=8):
     # One physical source can match several windows; do not pick the first.
     mappings, owners = defaultdict(set), defaultdict(set)
     for link in db.execute("SELECT * FROM links WHERE kind='拆分' ORDER BY id"):
         parts = tuple(json.loads(link["part_ids"]))
         mappings[link["one_id"]].add(parts)
-        for part in parts:
-            owners[part].add(link["one_id"])
-    groups, pending = [], []
+    prepared, pending = [], []
     for source in db.execute("SELECT * FROM records WHERE kind='source' ORDER BY id"):
         targets = mappings[source["id"]]
         if not targets and not (split_patterns(source["original"]) or split_patterns(source["korean"])):
             continue
-        patterns, baselines = None, []
-        if not targets:
-            reason = "发现格式候选，但扫描范围内没有对应的连续基准行；不代表需要拆分"
-        elif len(targets) != 1:
-            reason = f"同一源行对应 {len(targets)} 组基准位置，归属不唯一"
-        else:
-            ids = next(iter(targets))
-            baselines = [get_record(db, i) for i in ids]
-            if any(len(owners[i]) > 1 for i in ids):
-                reason = "同一基准行有多个源拆分候选，来源冲突"
-            else:
-                patterns, reason = trial_numbered_split(
-                    source["original"], source["korean"], [b["original"] for b in baselines])
+        patterns, reason = split_translation(source["original"], source["korean"])
+        if patterns and (len(patterns[0]["parts"]) > max_rows or len(comparison_key(source["original"])) > MAX_CHARACTERS):
+            patterns, reason = None, f"分段数超过{max_rows}或正文超过{MAX_CHARACTERS}字符；请调整范围或人工复核"
         if patterns is None:
             pending.append([source["id"], source["original"], source["korean"], reason,
                             source["path"], source["sheet"], source["row"], len(targets)])
         else:
-            groups.append((source, baselines, patterns))
+            keys = [comparison_key(p) for p in patterns[0]["parts"]]
+            full = [ids for ids in targets if [get_record(db, i)["text"] for i in ids] == keys]
+            choices = []
+            for index, key in enumerate(keys):
+                ids = [full[0][index]] if len(full) == 1 else [r[0] for r in db.execute(
+                    "SELECT id FROM records WHERE kind='baseline' AND text=? ORDER BY id", (key,))]
+                choices.append(ids)
+                for record_id in ids:
+                    owners[record_id].add((source["id"], index))
+            prepared.append((source, patterns, choices))
+
+    groups, unmatched = [], []
+    for source, patterns, choices in prepared:
+        accepted, reasons = [], []
+        for index, ids in enumerate(choices):
+            reason = ""
+            if not ids:
+                reason = "本段在基准中没有对应中文"
+            elif len(ids) > 1:
+                reason = f"本段对应{len(ids)}个基准位置，归属不唯一"
+            elif len(owners[ids[0]]) > 1:
+                reason = "同一基准行有多个源分段候选，来源冲突"
+            if reason:
+                reasons.append(f"第{index + 1}段：{reason}")
+                unmatched.append([f"T{source['id']}", index + 1, patterns[0]["parts"][index], patterns[1]["parts"][index],
+                                  reason, source["path"], source["sheet"], source["row"], len(ids)])
+            else:
+                accepted.append((index, get_record(db, ids[0])))
+                db.execute("INSERT OR IGNORE INTO covered VALUES (?)", (ids[0],))
+        db.execute("INSERT INTO trial_coverage VALUES (?,?,?)", (source["id"], len(accepted), len(choices)))
+        if accepted:
+            groups.append((source, accepted, patterns))
+            if len(accepted) == len(choices):
+                db.execute("INSERT OR IGNORE INTO covered VALUES (?)", (source["id"],))
+        if reasons:
+            pending.append([source["id"], source["original"], source["korean"],
+                            f"已匹配{len(accepted)}/{len(choices)}段；" + "；".join(reasons),
+                            source["path"], source["sheet"], source["row"], len(mappings[source["id"]])])
 
     def details():
-        for source, baselines, (cn, ko) in groups:
-            evidence = context_evidence(db, [source], baselines)
-            for index, baseline in enumerate(baselines):
-                yield [f"T{source['id']}", cn["labels"][index],
-                       cn["parts"][index].strip(), ko["parts"][index].strip(),
+        for source, accepted, (cn, ko) in groups:
+            evidence = context_evidence(db, [source], [b for _, b in accepted])
+            for index, baseline in accepted:
+                yield [f"T{source['id']}", cn["labels"][index] if cn["labels"] else str(index + 1),
+                       trim_segment(cn["parts"][index]), trim_segment(ko["parts"][index]) if cn["labels"] else ko["parts"][index],
                        baseline["original"], "试拆分，待人工复核语义",
                        baseline["path"], baseline["sheet"], baseline["row"],
                        source["path"], source["sheet"], source["row"],
                        cn["parts"][index], ko["parts"][index],
                        f"{cn['spans'][index][0] + 1}～{cn['spans'][index][1]}",
-                       f"{ko['spans'][index][0] + 1}～{ko['spans'][index][1]}", evidence]
+                       f"{ko['spans'][index][0] + 1}～{ko['spans'][index][1]}", evidence,
+                       cn["rule"], f"{len(accepted)}/{len(cn['parts'])}段"]
 
     book = Workbook(write_only=True)
     segments = write_detail_sheet(book, "拆分明细",
         ["组ID", "选项编号", "拆分中文", "拆分韩文", "基准中文", "状态",
          "基准完整路径", "基准Sheet", "基准行号", "源完整路径", "源Sheet", "源行号",
-         "中文分段原值", "韩文分段原值", "中文字符位置", "韩文字符位置", "邻句证据"],
-        details(), [16, 12, 45, 55, 45, 30, 50, 20, 12, 50, 20, 12, 50, 60, 20, 20, 65], progress)
+         "中文分段原值", "韩文分段原值", "中文字符位置", "韩文字符位置", "邻句证据", "拆分规则", "整组匹配情况"],
+        details(), [16, 12, 45, 55, 45, 30, 50, 20, 12, 50, 20, 12, 50, 60, 20, 20, 65, 24, 18], progress)
     write_detail_sheet(book, "整组原文",
         ["组ID", "源中文原值", "源韩文原值", "段数", "源完整路径", "源Sheet", "源行号"],
-        ([f"T{s['id']}", s["original"], s["korean"], len(b), s["path"], s["sheet"], s["row"]]
-         for s, b, _ in groups), [16, 65, 75, 10, 50, 20, 12])
+        ([f"T{s['id']}", s["original"], s["korean"], len(p[0]["parts"]), s["path"], s["sheet"], s["row"]]
+         for s, _, p in groups), [16, 65, 75, 10, 50, 20, 12])
+    write_detail_sheet(book, "分段未匹配",
+        ["组ID", "段序号", "分段中文", "分段韩文", "原因", "源完整路径", "源Sheet", "源行号", "基准候选数"],
+        unmatched, [16, 12, 60, 60, 80, 55, 22, 14, 18])
+    write_detail_sheet(book, "分段候选",
+        ["组ID", "段序号", "分段中文", "基准完整路径", "基准Sheet", "基准行号", "基准中文"],
+        ([f"T{s['id']}", i + 1, p[0]["parts"][i], b["path"], b["sheet"], b["row"], b["original"]]
+         for s, p, choices in prepared for i, ids in enumerate(choices) for record_id in ids
+         for b in [get_record(db, record_id)]), [16, 12, 60, 55, 22, 14, 60])
     write_detail_sheet(book, "暂不拆分",
         ["源记录ID", "源中文", "源韩文", "原因", "源完整路径", "源Sheet", "源行号", "基准位置组数"],
         pending, [16, 65, 75, 75, 50, 20, 12, 18])
     write_detail_sheet(book, "拆分说明", ["项目", "值"], [
         ["结果", f"试拆分 {len(groups)} 组 / {segments} 条；暂不拆分 {len(pending)} 个源行"],
-        ["本版规则", "中韩均为从1连续排列的数字编号，编号顺序和段数一致，中文分段与连续基准逐条一致"],
-        ["位置要求", "源行只能对应一组基准位置；同一基准行不能有多个源拆分候选；邻句证据供复核"],
-        ["文本处理", "移除选项编号及分段首尾空白；原值和原文字符位置保留在明细及整组原文中，内部文字、标点、标签及占位符保留"],
+        ["本版规则", "优先数字编号；中文无编号时按实际或字面换行拆分，中韩段数须一致。中文逐段查找，可部分匹配，保留原段序号"],
+        ["位置要求", "优先采用唯一的整组连续对应；其他段只有唯一基准位置且无来源冲突才出预览；所有对应仅供复核"],
+        ["文本处理", "编号模式移除编号及分段首尾空白；换行模式保留每段韩语原值和编号。两侧仅去除空白边缘行，内部空行不跳过，不按中文长度切韩语"],
         ["拒绝条件", "前缀、重复或跳号、空段、选项内部换行、中韩占位符差异、跨段或未闭合展示标签均暂不拆分"],
         ["待复核", "本表仅为试拆分预览，编号一致不证明译文语义正确；不回填基准TextTrans，不改动输入文件"],
+        ["部分匹配", "拆分明细只列可定位的段；其余见分段未匹配，全部对应见分段候选；暂不拆分包含部分匹配组的剩余问题"],
         ["覆盖范围", "沿用同目录结构差异扫描.xlsx的扫描设置及跳过清单；暂不拆分只列格式或拆分候选，不代表所有这些行都需要拆分"],
     ], [24, 110])
     book.save(destination)
@@ -870,10 +957,10 @@ def write_report(db, destination, skipped, report, baseline_root, max_rows, prog
         ["合并反查顺序", "先对全部基准检查整句命中；只有char.xlsx（文件名不区分大小写）中无中文候选的行参与合并反查，已有候选但缺译或冲突的行保留常规处理"],
         ["合并范围", "story.xlsx及其他基准不参与合并反查；继续整句匹配及拆分扫描。范围外行不能标记为反查未命中，分文件统计见试合并结果.xlsx的合并范围表"],
         ["试合并预览", "同目录试合并结果.xlsx提供换行连接的韩文预览、全部候选、整句命中检查和流程统计"],
-        ["试拆分预览", "同目录试拆分结果.xlsx按数字编号生成独立中韩分段预览，具体条件见拆分说明；候选仍需人工复核"],
+        ["试拆分预览", "同目录试拆分结果.xlsx按数字编号或换行生成独立中韩分段预览，支持部分定位，具体条件见拆分说明；候选仍需人工复核"],
         ["窗口边界", "同文件同Sheet连续物理行；不跨空白、非文本、排除行或显式场景变化。没有场景列时无法保证不跨语义场景"],
         ["场景识别", "可识别场景、场景名、场景编号中的唯一列，非空场景值沿用到下次变化；多个场景列需先澄清"],
-        ["搜索范围", "双方连续2至最大行数；超范围或需要跳行的情况列为未解释，不证明不存在对应"],
+        ["搜索范围", "整组候选限双方连续2至最大行数；试拆分还逐段查找基准并报告未定位原因；不证明未解释内容不存在对应"],
         ["中韩验证", "编号、顺序和数量仅提供结构证据，无法证明语义对应。没有韩文边界时不按中文长度切割"],
         ["原文回查", "候选展示过长会明确提示截断；完整文本见原始内容。字符位置从1起、含首尾，按未清理原文计数"],
         ["候选计数", "不同来源、不同窗口或不同拆法分别计数，不代表可以自动同步的唯一行数；所有候选均待复核"],
@@ -906,9 +993,9 @@ def scan_structure(report, baseline_root, output_root, ignored_sheets=(), progre
             index_merge_targets(db)
             find_links(db, max_rows, progress)
             assessments, reviews = merge_assessments(db, reviews, review_report)
+            progress("生成编号及换行试拆分预览")
+            trial_counts = write_trial_report(db, staging / "试拆分结果.xlsx", progress, max_rows)
             counts = write_report(db, staging / "结构差异扫描.xlsx", skipped, fresh, baseline_root, max_rows, progress, assessments)
-            progress("生成数字编号试拆分预览")
-            trial_counts = write_trial_report(db, staging / "试拆分结果.xlsx", progress)
             progress("生成 char.xlsx 未匹配行的反查试合并预览")
             merge_counts = write_merge_trial_report(db, staging / "试合并结果.xlsx", max_rows, progress, assessments)
             source_rows, baseline_rows = [db.execute("SELECT COUNT(*) FROM records WHERE kind=?", (k,)).fetchone()[0]

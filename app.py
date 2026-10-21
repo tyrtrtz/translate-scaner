@@ -521,7 +521,7 @@ class Application:
         summary_frame.columnconfigure(0, weight=1)
         self.match_summary.trace_add("write", self.render_match_summary)
         self.render_match_summary()
-        self.match_rules_label = ttk.Label(match_content, text="原文件只读；常规匹配写入副本，结构扫描生成独立预览。", style="CardMuted.TLabel", wraplength=620, justify="left")
+        self.match_rules_label = ttk.Label(match_content, text="结果写入副本；最后以 80% 为下限补查模糊匹配，模糊推荐标明待复核。", style="CardMuted.TLabel", wraplength=620, justify="left")
         self.match_rules_label.pack(side="bottom", anchor="w", fill="x", pady=(4, 0), before=summary_frame)
         match_content.bind("<Configure>", self.resize_match_text)
 
@@ -893,7 +893,7 @@ class Application:
                                    f"试拆分 {value.trial_groups} 组 / {value.trial_segments} 条；暂不拆分 {value.trial_pending} 个源行。\n"
                                    f"已生成综合推荐：匹配 {value.match_report.matched_rows} 行，推荐 {value.match_report.recommended_rows} 行。\n"
                                    f"结果位置：{value.destination}\n"
-                                   "点击“打开结果文件夹”查看基准副本；按推荐状态筛选“合并推荐·待复核”或“拆分推荐·待复核”。\n"
+                                   "点击“打开结果文件夹”查看基准副本；按推荐状态筛选合并、拆分或模糊推荐，均需复核。\n"
                                    "试合并中的“复核填写”可保存后选择重跑；复核自动保存，内容变化后需重审。")
                         self.match_summary.set(summary)
                         self.status.set(summary.split("\n")[0])

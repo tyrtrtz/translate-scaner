@@ -529,9 +529,35 @@ class StructureScanTests(unittest.TestCase):
             book.close()
         self.assertEqual(hashes, {p: hashlib.sha256(p.read_bytes()).digest() for p in hashes})
 
+    def test_fuzzy_pass_follows_structure_and_excludes_used_or_partially_used_sources(self):
+        self.workbook(self.source, [
+            ['台词', '한국어'], ['前锚', '앞'], ['春风吹过山岗', '봄바람'], ['花香飘进小院', '꽃향기'], ['后锚', '뒤'],
+            ['春风吹过山岗花香飘进小院啊', '低优先级模糊译文'],
+            ['单独需要拆分\n剩余未命中', '부분1\n부분2'], [None, None], ['春风吹过山岗', '봄바람'],
+        ])
+        self.workbook(self.baseline, [['Text'], ['前锚'], ['春风吹过山岗花香飘进小院'], ['后锚'],
+                                     ['春风吹过山冈'], ['单独需要拆分'], ['单独需要拆分剩余未命中啊']])
+        result, _ = self.scan()
+        book = load_workbook(result.match_report.destination / '基准匹配结果/char.xlsx')
+        try:
+            self.assertEqual((book.active['AD3'].value, book.active['AG3'].value), ('봄바람 꽃향기', '合并推荐·待复核'))
+            self.assertEqual(book.active['AG5'].value, '未匹配')
+            self.assertEqual(book.active['AG6'].value, '拆分推荐·待复核')
+            self.assertEqual(book.active['AG7'].value, '未匹配')
+        finally:
+            book.close()
+        book = load_workbook(result.match_report.destination / '匹配明细.xlsx')
+        try:
+            self.assertFalse(any(r[23] == '模糊匹配' for r in list(book['匹配明细'].values)[1:]))
+            remaining = list(book['未推荐明细'].values)[1:]
+            self.assertTrue(any(r[4] == '单独需要拆分\n剩余未命中' and '部分分段' in r[-1] for r in remaining))
+            self.assertFalse(any(r[4] == '春风吹过山岗' for r in remaining))
+        finally:
+            book.close()
+
     def test_merge_split_competition_does_not_pick_an_arbitrary_translation(self):
         self.workbook(self.source, [['台词', '한국어'], ['前锚', '앞'], ['甲', '가'], ['乙', '나'],
-                                   ['后锚', '뒤'], ['甲乙\n独立', '다른\n독립']])
+                                   ['后锚', '뒤'], ['甲乙\n独立', '다른\n독립'], ['甲乙啊', '不可绕过结构冲突']])
         self.workbook(self.baseline, [['Text'], ['前锚'], ['甲乙'], ['后锚'], ['独立']])
         result, _ = self.scan()
         self.assertEqual(result.match_report.recommended_rows, 3)

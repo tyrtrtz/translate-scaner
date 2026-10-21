@@ -2,6 +2,7 @@ import hashlib
 import tempfile
 import unittest
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 from zipfile import ZipFile
 from xml.etree import ElementTree as ET
@@ -51,6 +52,109 @@ class TranslationMatches(unittest.TestCase):
         book.save(path)
         book.close()
         return path
+
+    def test_fuzzy_recommendations_keep_existing_results_ties_and_source_evidence(self):
+        target = '但我不想成为一个训练有素的龙人，我只想成为一个无忧无虑的可爱小妖精…'
+        repeated = target.replace('只想成为', '只想成为成为')
+        source = self.write_source([
+            [repeated, '\n=추천\n'], [repeated, '\n=추천\n'],
+            [target.replace('小妖精', '小妖怪啊'), '较低分译文'],
+            ['甲乙丙丁己', '不同译文1'], ['甲乙丙丁庚', '不同译文2'],
+            ['天地玄黄宙', None], ['春夏秋风雨', '低于阈值'],
+            ['整句优先原文', '整句译文'], ['整句优先原文！', '不覆盖'],
+            ['已有争议原文', '冲突1'], ['已有争议原文', '冲突2'], ['已有争议原文！', '不消除冲突'],
+            ['……？!', '标点不能模糊推荐'],
+        ])
+        book = load_workbook(source)
+        # Preserve a formula-looking translation as literal source text.
+        for number in (2, 3):
+            book.active.cell(number, 2).data_type = 's'
+        book.save(source); book.close()
+        baseline = self.write_baseline([target, '甲乙丙丁戊', '天地玄黄宇', '春夏秋冬晴',
+                                        '整句优先原文', '已有争议原文', '……？！'])
+        self.write_baseline(['\n'+target+'\n'], name='another.xlsx')
+        hashes = {p: hashlib.sha256(p.read_bytes()).digest() for p in (source, baseline)}
+        result = match_folder(scan_folder(self.source), self.baseline, self.output)
+        book = load_workbook(result.destination / '基准匹配结果/story.xlsx')
+        sheet = book.active
+        self.assertEqual((sheet['AD2'].value, sheet['AG2'].value), ('=추천', '模糊推荐·待复核'))
+        self.assertEqual(sheet['AD2'].data_type, 's')
+        score = SequenceMatcher(None, target, repeated, autojunk=False).ratio()
+        self.assertIn(f'{score:.1%}', sheet['AF2'].value)
+        self.assertEqual(sheet['AA2'].value, 3)
+        self.assertEqual(sheet['AC2'].value, '是')  # Lower-scoring variants remain visible.
+        self.assertIsNone(sheet['AD3'].value)
+        self.assertIn('最高相似度对应不同韩语', sheet['AF3'].value)
+        self.assertEqual((sheet['AG4'].value, sheet['AB4'].value), ('全部缺译', 1))
+        self.assertEqual(sheet['AG5'].value, '未匹配')
+        self.assertEqual((sheet['AD6'].value, sheet['AG6'].value), ('整句译文', '唯一译文'))
+        self.assertEqual((sheet['AD7'].value, sheet['AG7'].value, sheet['AA7'].value), (None, '待确认', 2))
+        self.assertEqual(sheet['AG8'].value, '未匹配')
+        book.close()
+        book = load_workbook(result.destination / '基准匹配结果/another.xlsx')
+        self.assertEqual(book.active['AD2'].value, '\n=추천\n')
+        book.close()
+        book = load_workbook(result.destination / '匹配明细.xlsx')
+        rows = list(book['匹配明细'].values)
+        candidates = [dict(zip(rows[0], r)) for r in rows[1:] if r[23] == '模糊匹配']
+        self.assertEqual(len(candidates), 9)
+        chosen = [r for r in candidates if r['推荐来源'] == '是']
+        self.assertEqual(len(chosen), 2)
+        self.assertTrue(all(r['源中文'] == repeated and r['基准中文'] == target for r in chosen))
+        self.assertTrue(all(abs(r['相似度'] - score) < 1e-12 and r['完美匹配'] == '否' for r in chosen))
+        self.assertEqual(book['匹配明细']['AC2'].number_format, '0.0%')
+        unused = list(book['未推荐明细'].values)[1:]
+        self.assertFalse(any(r[4] == repeated for r in unused))
+        self.assertTrue(all(r[-1] == '基准文件中找到了但不符合推荐规则' for r in unused if r[4] in ('甲乙丙丁己', '甲乙丙丁庚')))
+        self.assertEqual(result.match_pairs, len(rows)-1)
+        book.close()
+        book = load_workbook(result.destination / '基准文件匹配统计.xlsx')
+        total = list(book['总体统计'].values)[1]
+        self.assertEqual(total[2:11], (8, 6, 5, 3, 2, 1, 4, 2, 2))
+        book.close()
+        self.assertEqual(hashes, {p: hashlib.sha256(p.read_bytes()).digest() for p in hashes})
+
+    def test_fuzzy_index_matches_exhaustive_scoring_including_threshold_and_repeated_text(self):
+        sources = ['甲乙', '丙丁戊己', 'abcde', 'a'*220+'b', '测'*25+'试'*25,
+                   '春夏秋冬', '冬秋夏春', '竹松梅兰菊', '🙂你好世界']
+        targets = ['甲乙补', '丙丁戊己补充', 'abcdf', 'a'*220+'c', '测'*25+'式'*25,
+                   '春夏秋风', '冬秋夏风', '竹松梅兰草', '🙂你好世间', '戊甲乙']
+        self.write_source([[text, f'译文{i}'] for i, text in enumerate(sources)])
+        self.write_baseline(targets)
+        expected = {(s, b): round(score, 12) for s in sources for b in targets
+                    if (score := SequenceMatcher(None, b, s, autojunk=False).ratio()) >= .8}
+        result = match_folder(scan_folder(self.source), self.baseline, self.output)
+        book = load_workbook(result.destination / '匹配明细.xlsx')
+        actual = {(r[8], r[27]): round(r[28], 12) for r in list(book['匹配明细'].values)[1:]}
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual[('甲乙', '甲乙补')], .8)
+        self.assertEqual(actual[('丙丁戊己', '丙丁戊己补充')], .8)
+        book.close()
+
+    def test_fuzzy_pass_obeys_source_filters_and_does_not_reuse_matched_sources(self):
+        source = self.write_source([['已用整句台词', '不能再次模糊使用'],
+                                    ['<color=red>新增近似句子啊</color>', '新译文'],
+                                    ['隐藏过滤句子啊', '隐藏'], ['废弃过滤句子啊', '废弃']])
+        book = load_workbook(source)
+        book.active['C1'] = '特殊说明'
+        book.active.row_dimensions[4].hidden = True
+        book.active['C5'] = '废弃'
+        for title, headers, cn in [('忽略', ['台词', '한국어'], '忽略过滤句子啊'),
+                                    ('异常', ['未知列', '未知列2'], '异常过滤句子啊')]:
+            sheet = book.create_sheet(title); sheet.append(headers); sheet.append([cn, '不可参与'])
+        book.save(source); book.close()
+        ignored = {sheet_key(source, '忽略')}
+        self.write_baseline(['已用整句台词', '已用整句台词！', '新增近似句子呀',
+                             '隐藏过滤句子呀', '废弃过滤句子呀', '忽略过滤句子呀', '异常过滤句子呀'])
+        result = match_folder(scan_folder(self.source, include_hidden_rows=False, ignored_sheets=ignored),
+                              self.baseline, self.output, ignored_sheets=ignored)
+        book = load_workbook(result.destination / '基准匹配结果/story.xlsx')
+        self.assertEqual(book.active['AG4'].value, '模糊推荐·待复核')
+        self.assertEqual(book.active['AD4'].value, '新译文')
+        for row in (3, 5, 6, 7, 8):
+            self.assertEqual(book.active.cell(row, 33).value, '未匹配')
+        book.close()
+        self.assertEqual(result.recommended_rows, 2)
 
     def test_baseline_headers_move_independently_per_sheet(self):
         self.write_source([["前一", "앞1"], ["前二", "앞2"], ["前三", "앞3"], ["目标", "추천"]])
@@ -277,10 +381,12 @@ class TranslationMatches(unittest.TestCase):
         self.write_baseline(["独有隐藏", "一条"], name="char.xlsx")
         original = {p: hashlib.sha256(p.read_bytes()).digest() for p in (source, *self.baseline.iterdir())}
         result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
-        self.assertEqual((result.baseline_rows, result.matched_rows), (9, 7))
+        self.assertEqual((result.baseline_rows, result.matched_rows), (9, 8))
         book = load_workbook(result.destination / "基准匹配结果/story.xlsx")
         sheet = book.active
-        self.assertEqual([sheet.cell(i, 27).value for i in range(2, 9)], [1, 2, 3, 4, 0, 1, 0])
+        self.assertEqual([sheet.cell(i, 27).value for i in range(2, 9)], [1, 2, 3, 4, 0, 1, 1])
+        self.assertEqual(sheet['AG8'].value, '模糊推荐·待复核')
+        self.assertIn('88.9%', sheet['AF8'].value)
         self.assertEqual(sheet["R2"].value, "一条")
         self.assertEqual(sheet["S2"].value, "번역1")
         self.assertIn("行号：2", sheet["T2"].value)
@@ -296,8 +402,8 @@ class TranslationMatches(unittest.TestCase):
         book.close()
         stats = load_workbook(result.destination / "源文件匹配统计.xlsx")
         row = list(stats["文件统计"].values)[1]
-        self.assertEqual(row[2:7], (2, 0, 14, 12, 2))
-        self.assertAlmostEqual(row[7], 12 / 14)
+        self.assertEqual(row[2:7], (2, 0, 14, 13, 1))
+        self.assertAlmostEqual(row[7], 13 / 14)
         self.assertEqual(stats["文件统计"]["H2"].number_format, "0.00%")
         stats.close()
         self.assertEqual(original, {p: hashlib.sha256(p.read_bytes()).digest() for p in original})
@@ -467,7 +573,7 @@ class TranslationMatches(unittest.TestCase):
                                         '{other}<size=12></size>', '价格101，OK', '精确优先', '废弃候选'])
         before = {p: hashlib.sha256(p.read_bytes()).digest() for p in (first,second,baseline)}
         result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
-        self.assertEqual((result.baseline_rows,result.matched_rows,result.recommended_rows,result.source_matched,result.match_pairs), (6,3,3,3,3))
+        self.assertEqual((result.baseline_rows,result.matched_rows,result.recommended_rows,result.source_matched,result.match_pairs), (6,4,4,4,4))
         book = load_workbook(result.destination / '基准匹配结果/story.xlsx')
         sheet = book.active
         for row, ko in ((2,'<color=#3266b4>번역</color>'), (3,'이름{playername}\\n원문')):
@@ -476,31 +582,33 @@ class TranslationMatches(unittest.TestCase):
             self.assertEqual(sheet.cell(row,27).value, 1)
         self.assertEqual(sheet['AD6'].value, '原推荐')
         self.assertNotIn('仅纯文本匹配', sheet['AF6'].value)
-        self.assertEqual((sheet['AA4'].value,sheet['AA5'].value), (0,0))
+        self.assertEqual((sheet['AA4'].value,sheet['AA5'].value), (0,1))
+        self.assertEqual(sheet['AG5'].value, '模糊推荐·待复核')
+        self.assertIn('87.5%', sheet['AF5'].value)
         self.assertIsNone(sheet['AD7'].value)
         book.close()
         book = load_workbook(result.destination / '匹配明细.xlsx')
         rows = list(book['匹配明细'].values)
         self.assertEqual(rows[0][23], '匹配方式')
-        self.assertEqual(rows[0][-1], '上下文查询统计')
+        self.assertEqual(rows[0][26:], ('上下文查询统计', '基准中文', '相似度'))
         self.assertEqual({r[8]:r[23] for r in rows[1:]},
-                         {'这是基准文件的原文':'纯文本补匹配','{playername}你好\\n世界':'纯文本补匹配','精确优先':'全文精确匹配'})
+                         {'这是基准文件的原文':'纯文本补匹配','{playername}你好\\n世界':'纯文本补匹配','精确优先':'全文精确匹配','价格100，OK':'模糊匹配'})
         unused = list(book['未推荐明细'].values)[1:]
         self.assertFalse(any(r[4] in ('这是基准文件的原文','{playername}你好\\n世界') for r in unused))
         self.assertFalse(any('废弃候选' in str(r) for r in unused))
         book.close()
         book = load_workbook(result.destination / '基准文件匹配统计.xlsx')
-        self.assertEqual(list(book['文件统计'].values)[1][2:11], (6,3,3,3,3,0,0,0,0))
+        self.assertEqual(list(book['文件统计'].values)[1][2:11], (6,4,4,4,2,0,0,0,0))
         book.close()
         book = load_workbook(result.destination / '源文件匹配统计.xlsx')
-        self.assertEqual(sum(r[5] for r in list(book['文件统计'].values)[1:]), 3)
+        self.assertEqual(sum(r[5] for r in list(book['文件统计'].values)[1:]), 4)
         book.close()
         self.assertEqual(before, {p: hashlib.sha256(p.read_bytes()).digest() for p in before})
         self.assertEqual(plain_key('{playername}<color=#3266b4>你好</color>\\n\r\n世界'), '你好世界')
         self.assertEqual(plain_key('价格100，OK < 200'), '价格100，OK < 200')
         self.assertEqual(plain_key('{name}<color=red></color>\\n'), '')
         included = match_folder(scan_folder(self.source, 1, include_deprecated=True), self.baseline, self.output)
-        self.assertEqual((included.matched_rows,included.recommended_rows), (4,4))
+        self.assertEqual((included.matched_rows,included.recommended_rows), (5,5))
 
     def test_plain_fallback_can_reuse_source_recommended_by_another_baseline(self):
         self.write_source([['共同句','번역']])
@@ -1002,7 +1110,7 @@ class TranslationMatches(unittest.TestCase):
         row = next(r for r in list(book["匹配明细"].values)[1:] if r[8] == "目标")
         self.assertEqual(row[16:20], (0, 2, 0, 2))
         self.assertEqual(row[24], "否")
-        self.assertEqual(row[-1], "向上：查询0行，演出0行，气息0行，匹配0句\n"
+        self.assertEqual(row[26], "向上：查询0行，演出0行，气息0行，匹配0句\n"
                          "向下：查询5行，演出1行，气息1行，匹配2句\n"
                          "合计（不含当前句）：查询5行，演出1行，气息1行，匹配2句")
         self.assertIsNone(row[14])

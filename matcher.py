@@ -6,6 +6,9 @@ import tempfile
 import shutil
 import re
 import json
+import unicodedata
+from collections import Counter
+from difflib import SequenceMatcher
 from io import TextIOWrapper
 from zipfile import ZipFile
 from xml.sax.expatreader import create_parser
@@ -30,9 +33,19 @@ def match_key(value):
 
 PLAIN_REVIEW_NOTE = "仅纯文本匹配，仍需复核标签"
 TAIL_MATCH = "句尾去括号补匹配"
+FUZZY_MATCH = "模糊匹配"
+FUZZY_MIN_PERCENT = 80
 CONTEXT_SKIP_NOTES = {"演出", "气息"}
 TEXT_TAG = re.compile(r"</?[A-Za-z][^<>\r\n]*>")
 CODE_TAGS = re.compile(r"\{[^{}\r\n]*\}|\\[nr]|[\r\n]")
+RECOMMENDED_PAIRS = """
+    SELECT DISTINCT chosen.text,chosen.korean_key
+    FROM recommendations r JOIN source_rows chosen ON chosen.rowid=r.source_id
+    UNION SELECT chosen.text,chosen.korean_key FROM source_rows chosen JOIN (
+        SELECT source_id FROM structure_sources GROUP BY source_id
+        HAVING MAX(complete)=1 OR COUNT(DISTINCT part)=MAX(total)
+    ) covered ON covered.source_id=chosen.rowid
+"""
 
 
 def plain_key(value):
@@ -387,6 +400,8 @@ def write_detail_sheet(book, title, headers, rows, widths, progress=None, row_li
             cell.alignment = Alignment(vertical="top", wrap_text=True)
             if headers[len(cells)].endswith("率"):
                 cell.number_format = "0.00%"
+            elif headers[len(cells)] == "相似度":
+                cell.number_format = "0.0%"
             cells.append(cell)
         sheet.append(cells)
         count += 1
@@ -479,6 +494,7 @@ def build_recommendations(connection, progress=None):
         CREATE TABLE comparisons (path TEXT,sheet TEXT,row INTEGER,source_id INTEGER,
             previous_equal INTEGER,following_equal INTEGER,full_sides INTEGER,match_type TEXT,
             baseline_previous TEXT,baseline_following TEXT,source_previous TEXT,source_following TEXT,skipped TEXT,query_statistics TEXT,
+            similarity REAL,
             PRIMARY KEY(path,sheet,row,source_id));
         CREATE INDEX comparison_source ON comparisons(source_id);
         CREATE TABLE recommendations (path TEXT,sheet TEXT,row INTEGER,source_id INTEGER,basis TEXT,status TEXT,match_type TEXT,
@@ -564,10 +580,10 @@ def build_recommendations(connection, progress=None):
                 pe = sum(a[1] == b[1] for a, b in zip(bp, used_sp))
                 fe = sum(a[1] == b[1] for a, b in zip(bf, used_sf))
                 full = int(len(bp) == len(used_sp) == pe == 3) + int(len(bf) == len(used_sf) == fe == 3)
-                connection.execute("INSERT OR REPLACE INTO comparisons VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                connection.execute("INSERT OR REPLACE INTO comparisons VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (path, sheet, row, source_id, pe, fe, full, candidate_type,
                      *(json.dumps(items, ensure_ascii=False) for items in (bp, bf, used_sp, used_sf)), skipped,
-                     context_statistics((sp, sf), pe, fe)))
+                     context_statistics((sp, sf), pe, fe), None))
                 if not korean_key:
                     continue
                 score = (full, pe + fe)
@@ -684,6 +700,112 @@ def apply_structure_recommendations(connection, candidates):
     return connection.execute("SELECT COUNT(*) FROM structure_recommendations").fetchone()[0]
 
 
+def apply_fuzzy_recommendations(connection, progress=None):
+    """Last-pass suggestions for unmatched sources and targets; index text on disk."""
+    connection.executescript(f"""
+        CREATE TEMP TABLE fuzzy_sources (source_id INTEGER PRIMARY KEY,text TEXT);
+        INSERT INTO fuzzy_sources
+            SELECT s.rowid,s.plain_text FROM source_rows s
+            WHERE s.plain_text!=''
+              AND NOT EXISTS (SELECT 1 FROM matched_sources m WHERE m.source_id=s.rowid)
+              AND NOT EXISTS (SELECT 1 FROM structure_pending_sources p WHERE p.source_id=s.rowid)
+              AND NOT EXISTS (SELECT 1 FROM ({RECOMMENDED_PAIRS}) r
+                              WHERE r.text=s.text AND r.korean_key=s.korean_key);
+        CREATE INDEX fuzzy_source_text ON fuzzy_sources(text);
+        CREATE INDEX baseline_plain ON baseline_rows(plain_text);
+        CREATE INDEX structure_pending_position ON structure_pending(path,sheet,row);
+        CREATE TEMP TABLE fuzzy_targets (id INTEGER PRIMARY KEY,text TEXT UNIQUE);
+        INSERT INTO fuzzy_targets(text)
+            SELECT DISTINCT b.plain_text FROM baseline_rows b WHERE b.plain_text!=''
+              AND EXISTS (SELECT 1 FROM fuzzy_sources)
+              AND NOT EXISTS (SELECT 1 FROM baseline_counts c
+                              WHERE c.path=b.path AND c.sheet=b.sheet AND c.row=b.row)
+              AND NOT EXISTS (SELECT 1 FROM structure_pending p
+                              WHERE p.path=b.path AND p.sheet=b.sheet AND p.row=b.row);
+        CREATE TEMP TABLE fuzzy_characters (
+            character TEXT,size INTEGER,target_id INTEGER,n INTEGER,
+            PRIMARY KEY(character,size,target_id)) WITHOUT ROWID;
+        CREATE TEMP TABLE fuzzy_query (character TEXT PRIMARY KEY,n INTEGER) WITHOUT ROWID;
+        CREATE TEMP TABLE fuzzy_scores (target_id INTEGER,text TEXT,similarity REAL,
+            PRIMARY KEY(target_id,text)) WITHOUT ROWID;
+    """)
+    if progress:
+        progress(f"对仍未匹配的句子查找相似文本（至少 {FUZZY_MIN_PERCENT}%）……")
+    has_text = lambda value: any(unicodedata.category(c).startswith("L") for c in value)
+    for target_id, text in connection.execute("SELECT id,text FROM fuzzy_targets"):
+        if has_text(text):
+            connection.executemany("INSERT INTO fuzzy_characters VALUES (?,?,?,?)",
+                [(c, len(text), target_id, n) for c, n in Counter(text).items()])
+    for index, (text,) in enumerate(connection.execute("SELECT DISTINCT text FROM fuzzy_sources ORDER BY text"), 1):
+        if not has_text(text):
+            continue
+        connection.execute("DELETE FROM fuzzy_query")
+        connection.executemany("INSERT INTO fuzzy_query VALUES (?,?)", Counter(text).items())
+        size = len(text)
+        lower = (size * FUZZY_MIN_PERCENT + 199 - FUZZY_MIN_PERCENT) // (200 - FUZZY_MIN_PERCENT)
+        upper = size * (200 - FUZZY_MIN_PERCENT) // FUZZY_MIN_PERCENT
+        # Length and shared character counts are upper bounds on SequenceMatcher's
+        # ratio, so this pruning cannot discard an above-threshold comparison.
+        candidates = connection.execute("""SELECT t.id,t.text FROM fuzzy_targets t JOIN (
+            SELECT f.target_id FROM fuzzy_query q JOIN fuzzy_characters f
+                ON f.character=q.character AND f.size BETWEEN ? AND ?
+            GROUP BY f.target_id HAVING 200*SUM(MIN(f.n,q.n)) >= ?*(f.size+?)
+        ) c ON c.target_id=t.id""", (lower, upper, FUZZY_MIN_PERCENT, size))
+        matcher = SequenceMatcher(None, "", text, autojunk=False)
+        for target_id, baseline_text in candidates:
+            matcher.set_seq1(baseline_text)
+            similarity = matcher.ratio()
+            if similarity * 100 >= FUZZY_MIN_PERCENT:
+                connection.execute("INSERT INTO fuzzy_scores VALUES (?,?,?)", (target_id, text, similarity))
+        if progress and index % 100 == 0:
+            progress(f"模糊匹配：已比较 {index} 种未匹配源句")
+    # Expand the fixed input snapshot only after scoring; one source may serve
+    # several baseline occurrences, independent of traversal order.
+    connection.execute("""INSERT INTO comparisons
+        SELECT b.path,b.sheet,b.row,s.source_id,0,0,0,?, '[]','[]','[]','[]','',
+               '本轮仅比较中文相似度，未使用上下文得分',f.similarity
+        FROM fuzzy_scores f JOIN fuzzy_targets t ON t.id=f.target_id
+        JOIN fuzzy_sources s ON s.text=f.text JOIN baseline_rows b ON b.plain_text=t.text
+        WHERE NOT EXISTS (SELECT 1 FROM baseline_counts c
+                          WHERE c.path=b.path AND c.sheet=b.sheet AND c.row=b.row)
+          AND NOT EXISTS (SELECT 1 FROM structure_pending p
+                          WHERE p.path=b.path AND p.sheet=b.sheet AND p.row=b.row)""", (FUZZY_MATCH,))
+    recommended = 0
+    for path, sheet, row, n, missing, variants, highest in connection.execute("""
+        SELECT e.path,e.sheet,e.row,COUNT(*),SUM(s.korean_key=''),
+               COUNT(DISTINCT NULLIF(s.korean_key,'')),MAX(e.similarity)
+        FROM comparisons e JOIN source_rows s ON s.rowid=e.source_id WHERE e.match_type=?
+        GROUP BY e.path,e.sheet,e.row""", (FUZZY_MATCH,)):
+        key = (path, sheet, row)
+        best = connection.execute("""SELECT e.source_id,s.korean_key,e.similarity
+            FROM comparisons e JOIN source_rows s ON s.rowid=e.source_id
+            WHERE e.path=? AND e.sheet=? AND e.row=? AND s.korean_key!=''
+            ORDER BY e.similarity DESC,e.source_id LIMIT 1""", key).fetchone()
+        source_id, status = None, "全部缺译"
+        reason = "达到阈值的来源韩语均为空，无法推荐"
+        if best:
+            highest = best[2]
+            tied = connection.execute("""SELECT 1 FROM comparisons e JOIN source_rows s ON s.rowid=e.source_id
+                WHERE e.path=? AND e.sheet=? AND e.row=? AND e.similarity=?
+                  AND s.korean_key!='' AND s.korean_key!=? LIMIT 1""", (*key, highest, best[1])).fetchone()
+            if tied:
+                status, reason = "待确认", "最高相似度对应不同韩语，无法唯一推荐"
+            else:
+                source_id, status = best[0], "模糊推荐·待复核"
+                reason = "采用最高相似度的非空译文；同分同译取读取顺序首条"
+                recommended += 1
+        basis = (f"模糊匹配，相似度 {highest:.1%}（最低 {FUZZY_MIN_PERCENT}%）；{reason}；"
+                 "按去标签及换行后的中文字符顺序比较；仍需复核文字差异、语义及标签")
+        connection.execute("UPDATE recommendations SET source_id=?,basis=?,status=?,match_type=? WHERE path=? AND sheet=? AND row=?",
+                           (source_id, basis, status, FUZZY_MATCH, *key))
+        connection.execute("INSERT INTO baseline_counts VALUES (?,?,?,?,?,?)", (*key, n, missing, variants))
+    connection.execute("INSERT OR IGNORE INTO matched_sources SELECT source_id FROM comparisons WHERE match_type=?", (FUZZY_MATCH,))
+    for table in ("fuzzy_sources", "fuzzy_targets", "fuzzy_characters", "fuzzy_query", "fuzzy_scores"):
+        connection.execute(f"DROP TABLE {table}")
+    connection.commit()
+    return recommended
+
+
 def write_baseline_statistics(destination, connection, baseline_parts):
     headers = ["非空中文行数", "中文匹配行数", "有译文行数", "推荐行数", "未匹配行数", "命中但全缺译行数",
                "冲突行数", "冲突已推荐行数", "冲突待确认行数", "中文匹配率", "译文覆盖率", "推荐率"]
@@ -731,7 +853,7 @@ def write_matching_details(destination, connection, progress=None):
                e.baseline_previous,e.baseline_following,e.source_previous,e.source_following,
                e.previous_equal,e.following_equal,e.full_sides,
                CASE WHEN r.source_id=s.rowid THEN '是' ELSE '否' END,
-               COALESCE(t.status,r.status),COALESCE(t.basis,r.basis),e.match_type,e.skipped,e.query_statistics
+               COALESCE(t.status,r.status),COALESCE(t.basis,r.basis),e.match_type,e.skipped,e.query_statistics,b.text,e.similarity
         FROM comparisons e JOIN source_rows s ON s.rowid=e.source_id
         JOIN baseline_rows b ON b.path=e.path AND b.sheet=e.sheet AND b.row=e.row
         JOIN baseline_counts c ON c.path=b.path AND c.sheet=b.sheet AND c.row=b.row
@@ -744,13 +866,14 @@ def write_matching_details(destination, connection, progress=None):
              context_text(json.loads(sp), "前"),context_text(json.loads(sf), "后"),
              pe,fe,full,pe+fe,selected,status,basis,match_type,
              "是" if full == 2 else "否",
-             skipped if len(skipped) <= 32000 else skipped[:32000] + "\n（展示截断，完整特殊行见上下文排除明细）", statistics]
-            for b,bs,br,p,ss,sr,cn,ko,missing,conflict,bp,bf,sp,sf,pe,fe,full,selected,status,basis,match_type,skipped,statistics in matches)
+             skipped if len(skipped) <= 32000 else skipped[:32000] + "\n（展示截断，完整特殊行见上下文排除明细）", statistics,
+             baseline_text, similarity]
+            for b,bs,br,p,ss,sr,cn,ko,missing,conflict,bp,bf,sp,sf,pe,fe,full,selected,status,basis,match_type,skipped,statistics,baseline_text,similarity in matches)
     pairs = write_detail_sheet(book, "匹配明细",
                                ["基准文件名","基准完整路径","基准 Sheet","基准行号","源文件名","源完整路径","源 Sheet","源行号","源中文","韩语","缺译","译文冲突",
                                 "基准前3句","基准后3句","来源前3句","来源后3句","前句一致数","后句一致数","完整一致侧数","一致位置总数","推荐来源","推荐状态","推荐依据","匹配方式",
-                                "完美匹配","上下文跳过位置","上下文查询统计"],
-                               rows, [30,65,25,16,35,65,25,16,55,55,12,16,65,65,65,65,18,18,20,20,16,24,70,24,16,75,75], progress)
+                                "完美匹配","上下文跳过位置","上下文查询统计","基准中文","相似度"],
+                               rows, [30,65,25,16,35,65,25,16,55,55,12,16,65,65,65,65,18,18,20,20,16,24,70,24,16,75,75,65,16], progress)
     structure_headers = ["基准完整路径", "基准Sheet", "基准行号", "基准中文", "推荐韩语", "推荐来源",
                          "推荐依据", "推荐状态", "类型", "组ID"]
     pairs += write_detail_sheet(book, "合并拆分推荐", structure_headers,
@@ -777,15 +900,8 @@ def write_matching_details(destination, connection, progress=None):
                 for p,sheet,row,cn,ko,matched,missing,variants in records)
         write_detail_sheet(book, title, ["源文件名","源完整路径","源 Sheet","源行号","源中文","韩语","命中基准","缺译","非空韩语种类数"],
                            rows, [35,65,25,16,55,55,16,12,24], progress)
-    records = connection.execute("""
-        WITH recommended_pairs AS (
-            SELECT DISTINCT chosen.text,chosen.korean_key
-            FROM recommendations r JOIN source_rows chosen ON chosen.rowid=r.source_id
-            UNION SELECT chosen.text,chosen.korean_key FROM source_rows chosen JOIN (
-                SELECT source_id FROM structure_sources GROUP BY source_id
-                HAVING MAX(complete)=1 OR COUNT(DISTINCT part)=MAX(total)
-            ) covered ON covered.source_id=chosen.rowid
-        )
+    records = connection.execute(f"""
+        WITH recommended_pairs AS ({RECOMMENDED_PAIRS})
         SELECT s.path,s.sheet,s.row,s.chinese,s.korean,
                CASE WHEN t.source_id IS NOT NULL THEN '是' ELSE '否' END,
                CASE WHEN s.korean_key='' THEN '是' ELSE '否' END,
@@ -1064,6 +1180,7 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                 progress("比较前后三句并生成推荐……")
             recommended_rows = build_recommendations(connection, progress)
             recommended_rows += apply_structure_recommendations(connection, structure_candidates)
+            recommended_rows += apply_fuzzy_recommendations(connection, progress)
             for row in sheet_rows:
                 row[4] = connection.execute("""SELECT COUNT(*) FROM source_rows s JOIN matched_sources m ON m.source_id=s.rowid
                     WHERE s.path=? AND s.sheet=?""", (row[1], row[2])).fetchone()[0]

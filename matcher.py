@@ -36,7 +36,6 @@ PLAIN_PUNCTUATION = str.maketrans({"…": "...", "，": ",", "；": ";", "：": 
 TAIL_MATCH = "句尾去括号补匹配"
 FUZZY_MATCH = "模糊匹配"
 FUZZY_MIN_PERCENT = 80
-FUZZY_REVIEW_PERCENT = 50
 CONTEXT_SKIP_NOTES = {"演出", "气息"}
 TEXT_TAG = re.compile(r"</?[A-Za-z][^<>\r\n]*>")
 CODE_TAGS = re.compile(r"\{[^{}\r\n]*\}|\\[nr]|[\r\n]")
@@ -730,11 +729,9 @@ def apply_fuzzy_recommendations(connection, progress=None):
         CREATE TEMP TABLE fuzzy_query (character TEXT PRIMARY KEY,n INTEGER) WITHOUT ROWID;
         CREATE TEMP TABLE fuzzy_scores (target_id INTEGER,text TEXT,similarity REAL,
             PRIMARY KEY(target_id,text)) WITHOUT ROWID;
-        CREATE TEMP TABLE fuzzy_review (source_id INTEGER,path TEXT,sheet TEXT,row INTEGER,similarity REAL);
-        CREATE INDEX fuzzy_review_source ON fuzzy_review(source_id);
     """)
     if progress:
-        progress(f"查找相似文本（{FUZZY_MIN_PERCENT}% 起推荐，{FUZZY_REVIEW_PERCENT}% 起保留复核线索）……")
+        progress(f"对仍未匹配的句子查找相似文本（至少 {FUZZY_MIN_PERCENT}%）……")
     has_text = lambda value: any(unicodedata.category(c).startswith("L") for c in value)
     for target_id, text in connection.execute("SELECT id,text FROM fuzzy_targets"):
         if has_text(text):
@@ -746,44 +743,34 @@ def apply_fuzzy_recommendations(connection, progress=None):
         connection.execute("DELETE FROM fuzzy_query")
         connection.executemany("INSERT INTO fuzzy_query VALUES (?,?)", Counter(text).items())
         size = len(text)
-        lower = (size * FUZZY_REVIEW_PERCENT + 199 - FUZZY_REVIEW_PERCENT) // (200 - FUZZY_REVIEW_PERCENT)
-        upper = size * (200 - FUZZY_REVIEW_PERCENT) // FUZZY_REVIEW_PERCENT
+        lower = (size * FUZZY_MIN_PERCENT + 199 - FUZZY_MIN_PERCENT) // (200 - FUZZY_MIN_PERCENT)
+        upper = size * (200 - FUZZY_MIN_PERCENT) // FUZZY_MIN_PERCENT
         # Length and shared character counts are upper bounds on SequenceMatcher's
         # ratio, so this pruning cannot discard an above-threshold comparison.
         candidates = connection.execute("""SELECT t.id,t.text FROM fuzzy_targets t JOIN (
             SELECT f.target_id FROM fuzzy_query q JOIN fuzzy_characters f
                 ON f.character=q.character AND f.size BETWEEN ? AND ?
             GROUP BY f.target_id HAVING 200*SUM(MIN(f.n,q.n)) >= ?*(f.size+?)
-        ) c ON c.target_id=t.id""", (lower, upper, FUZZY_REVIEW_PERCENT, size))
+        ) c ON c.target_id=t.id""", (lower, upper, FUZZY_MIN_PERCENT, size))
         matcher = SequenceMatcher(None, "", text, autojunk=False)
         for target_id, baseline_text in candidates:
             matcher.set_seq1(baseline_text)
             similarity = matcher.ratio()
-            if similarity * 100 >= FUZZY_REVIEW_PERCENT:
+            if similarity * 100 >= FUZZY_MIN_PERCENT:
                 connection.execute("INSERT INTO fuzzy_scores VALUES (?,?,?)", (target_id, text, similarity))
         if progress and index % 100 == 0:
             progress(f"模糊匹配：已比较 {index} 种未匹配源句")
     # Expand the fixed input snapshot only after scoring; one source may serve
     # several baseline occurrences, independent of traversal order.
-    connection.execute("""INSERT INTO fuzzy_review
-        SELECT s.source_id,b.path,b.sheet,b.row,f.similarity
-        FROM fuzzy_scores f JOIN fuzzy_targets t ON t.id=f.target_id
-        JOIN fuzzy_sources s ON s.text=f.text JOIN baseline_rows b ON b.plain_text=t.text
-        WHERE f.similarity*100 < ?
-          AND NOT EXISTS (SELECT 1 FROM baseline_counts c
-                          WHERE c.path=b.path AND c.sheet=b.sheet AND c.row=b.row)
-          AND NOT EXISTS (SELECT 1 FROM structure_pending p
-                          WHERE p.path=b.path AND p.sheet=b.sheet AND p.row=b.row)""", (FUZZY_MIN_PERCENT,))
     connection.execute("""INSERT INTO comparisons
         SELECT b.path,b.sheet,b.row,s.source_id,0,0,0,?, '[]','[]','[]','[]','',
                '本轮仅比较中文相似度，未使用上下文得分',f.similarity
         FROM fuzzy_scores f JOIN fuzzy_targets t ON t.id=f.target_id
         JOIN fuzzy_sources s ON s.text=f.text JOIN baseline_rows b ON b.plain_text=t.text
-        WHERE f.similarity*100 >= ?
-          AND NOT EXISTS (SELECT 1 FROM baseline_counts c
+        WHERE NOT EXISTS (SELECT 1 FROM baseline_counts c
                           WHERE c.path=b.path AND c.sheet=b.sheet AND c.row=b.row)
           AND NOT EXISTS (SELECT 1 FROM structure_pending p
-                          WHERE p.path=b.path AND p.sheet=b.sheet AND p.row=b.row)""", (FUZZY_MATCH, FUZZY_MIN_PERCENT))
+                          WHERE p.path=b.path AND p.sheet=b.sheet AND p.row=b.row)""", (FUZZY_MATCH,))
     recommended = 0
     for path, sheet, row, n, missing, variants, highest in connection.execute("""
         SELECT e.path,e.sheet,e.row,COUNT(*),SUM(s.korean_key=''),
@@ -924,25 +911,18 @@ def write_matching_details(destination, connection, progress=None):
                     WHEN EXISTS (SELECT 1 FROM structure_pending_sources p WHERE p.source_id=s.rowid)
                     THEN '结构候选未写入：' || (SELECT GROUP_CONCAT(DISTINCT p.reason)
                                               FROM structure_pending_sources p WHERE p.source_id=s.rowid)
-                    WHEN t.source_id IS NULL AND f.source_id IS NOT NULL
-                    THEN '相似度低于80%推荐阈值，仅供人工复核'
                     WHEN t.source_id IS NULL THEN '基准文件中找不到'
-                    ELSE '基准文件中找到了但不符合推荐规则' END,
-               f.similarity,b.text,f.path,f.sheet,f.row
+                    ELSE '基准文件中找到了但不符合推荐规则' END
         FROM source_rows s LEFT JOIN matched_sources t ON t.source_id=s.rowid
-        LEFT JOIN fuzzy_review f ON f.source_id=s.rowid
-        LEFT JOIN baseline_rows b ON b.path=f.path AND b.sheet=f.sheet AND b.row=f.row
         WHERE NOT EXISTS (SELECT 1 FROM recommended_pairs r
                           WHERE r.text=s.text AND r.korean_key=s.korean_key)
-        ORDER BY s.rowid,f.similarity DESC,f.path,f.sheet,f.row
+        ORDER BY s.rowid
     """)
-    rows = ([Path(p).name,p,sheet,row,cn,ko,matched,missing,reason,similarity,baseline_text,
-             Path(bp).name if bp else None,bp,bs,br]
-            for p,sheet,row,cn,ko,matched,missing,reason,similarity,baseline_text,bp,bs,br in records)
+    rows = ([Path(p).name,p,sheet,row,cn,ko,matched,missing,reason]
+            for p,sheet,row,cn,ko,matched,missing,reason in records)
     write_detail_sheet(book, "未推荐明细",
-                       ["源文件名","源完整路径","源 Sheet","源行号","源中文","韩语","命中基准","缺译","未推荐原因",
-                        "相似度","基准中文","基准文件名","基准完整路径","基准 Sheet","基准行号"],
-                       rows, [35,65,25,16,55,55,16,12,55,16,65,35,65,25,16], progress)
+                       ["源文件名","源完整路径","源 Sheet","源行号","源中文","韩语","命中基准","缺译","未推荐原因"],
+                       rows, [35,65,25,16,55,55,16,12,55], progress)
     book.save(destination)
     book.close()
     return pairs

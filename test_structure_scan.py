@@ -517,7 +517,7 @@ class StructureScanTests(unittest.TestCase):
             self.assertEqual([(r[3], r[-1]) for r in pending], [('已命中', '保留已有整句推荐')])
             unused = list(book['未推荐明细'].values)[1:]
             self.assertEqual({r[4] for r in unused}, {'1、已命中\n2、新拆', '留一\n缺一', '留一'})
-            self.assertTrue(all(r[8] == '拆分后仅部分分段获推荐，剩余分段待复核' for r in unused if '\n' in r[4]))
+            self.assertTrue(all(r[-1] == '拆分后仅部分分段获推荐，剩余分段待复核' for r in unused if '\n' in r[4]))
             self.assertEqual(next(r[7] for r in unused if r[4] == '留一'), '是')
             self.assertEqual(list(book['未匹配明细'].values)[1:], [])
         finally:
@@ -550,7 +550,7 @@ class StructureScanTests(unittest.TestCase):
         try:
             self.assertFalse(any(r[23] == '模糊匹配' for r in list(book['匹配明细'].values)[1:]))
             remaining = list(book['未推荐明细'].values)[1:]
-            self.assertTrue(any(r[4] == '单独需要拆分\n剩余未命中' and '部分分段' in r[8] for r in remaining))
+            self.assertTrue(any(r[4] == '单独需要拆分\n剩余未命中' and '部分分段' in r[-1] for r in remaining))
             self.assertFalse(any(r[4] == '春风吹过山岗' for r in remaining))
         finally:
             book.close()
@@ -567,7 +567,7 @@ class StructureScanTests(unittest.TestCase):
             self.assertEqual(len(pending), 2)
             self.assertTrue(all('多个结构推荐' in r[-1] for r in pending))
             unused = list(book['未推荐明细'].values)[1:]
-            self.assertTrue(all('结构候选未写入' in r[8] for r in unused if r[4] in ('甲', '乙')))
+            self.assertTrue(all('结构候选未写入' in r[-1] for r in unused if r[4] in ('甲', '乙')))
         finally:
             book.close()
         book = load_workbook(result.match_report.destination / '基准匹配结果/char.xlsx')

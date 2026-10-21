@@ -105,7 +105,7 @@ class TranslationMatches(unittest.TestCase):
         self.assertEqual(book['匹配明细']['AC2'].number_format, '0.0%')
         unused = list(book['未推荐明细'].values)[1:]
         self.assertFalse(any(r[4] == repeated for r in unused))
-        self.assertTrue(all(r[8] == '基准文件中找到了但不符合推荐规则' for r in unused if r[4] in ('甲乙丙丁己', '甲乙丙丁庚')))
+        self.assertTrue(all(r[-1] == '基准文件中找到了但不符合推荐规则' for r in unused if r[4] in ('甲乙丙丁己', '甲乙丙丁庚')))
         self.assertEqual(result.match_pairs, len(rows)-1)
         book.close()
         book = load_workbook(result.destination / '基准文件匹配统计.xlsx')
@@ -168,58 +168,7 @@ class TranslationMatches(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(actual[('甲乙', '甲乙补')], .8)
         self.assertEqual(actual[('丙丁戊己', '丙丁戊己补充')], .8)
-        selected = {r[8] for r in list(book['匹配明细'].values)[1:] if r[20] == '是'}
-        expected_review = {(s, b): round(score, 12) for s in sources if s not in selected for b in targets
-                           if .5 <= (score := SequenceMatcher(None, b, s, autojunk=False).ratio()) < .8}
-        actual_review = {(r[4], r[10]): round(r[9], 12) for r in list(book['未推荐明细'].values)[1:] if r[9] is not None}
-        self.assertEqual(actual_review, expected_review)
         book.close()
-
-    def test_low_similarity_details_expand_sources_and_preserve_recommendation_threshold(self):
-        source = self.write_source([['<color=red>甲乙丙丁</color>', '第一译文'],
-                                    ['<color=red>甲乙丙丁</color>', '第一译文'],
-                                    ['春夏秋冬', '达到80'], ['孤独句子', None],
-                                    ['……', '纯标点不比较'], ['冷暖,自知', '标点译文']])
-        targets = ['甲乙戊己', '{playername}甲乙丙戊', '=甲乙丙', '甲天地玄',
-                   '春夏秋冬晴雨', '春夏天地', '<color=red>冷暖，天地</color>']
-        first = self.write_baseline(targets)
-        book = load_workbook(first)
-        book.active['G4'].data_type = 's'
-        book.save(first); book.close()
-        second = self.write_baseline(['甲乙戊己'], name='another.xlsx')
-        hashes = {p: hashlib.sha256(p.read_bytes()).digest() for p in (source, first, second)}
-        result = match_folder(scan_folder(self.source), self.baseline, self.output)
-        self.assertEqual((result.recommended_rows, result.matched_rows, result.source_matched, result.match_pairs), (1, 1, 1, 1))
-        book = load_workbook(result.destination / '匹配明细.xlsx')
-        try:
-            sheet = book['未推荐明细']
-            records = list(sheet.values)
-            self.assertEqual(records[0][9:], ('相似度','基准中文','基准文件名','基准完整路径','基准 Sheet','基准行号'))
-            rows = records[1:]
-            expected = [(0.75, targets[1], first.name, str(first.resolve()), 'Sheet', 3),
-                        (0.75, targets[2], first.name, str(first.resolve()), 'Sheet', 4),
-                        (0.5, targets[0], second.name, str(second.resolve()), 'Sheet', 2),
-                        (0.5, targets[0], first.name, str(first.resolve()), 'Sheet', 2)]
-            for source_row in (2, 3):
-                candidates = [r for r in rows if r[3] == source_row]
-                self.assertEqual([r[9:] for r in candidates], expected)
-                self.assertTrue(all(r[6:9] == ('否', '否', '相似度低于80%推荐阈值，仅供人工复核') for r in candidates))
-            self.assertFalse(any(r[4] == '春夏秋冬' for r in rows))
-            self.assertTrue(all(r[9:] == (None,)*6 for r in rows if r[4] in ('孤独句子', '……')))
-            punctuation = next(r for r in rows if r[4] == '冷暖,自知')
-            self.assertEqual(punctuation[9:11], (.6, targets[-1]))
-            self.assertEqual(sheet['J2'].number_format, '0.0%')
-            self.assertTrue(all(cell.data_type == 's' for row in sheet for cell in row if cell.value == '=甲乙丙'))
-        finally:
-            book.close()
-        book = load_workbook(result.destination / '基准匹配结果/story.xlsx')
-        try:
-            self.assertEqual((book.active['AD6'].value, book.active['AG6'].value), ('达到80', '模糊推荐·待复核'))
-            for row in (2, 3, 4, 5, 7, 8):
-                self.assertEqual((book.active.cell(row, 30).value, book.active.cell(row, 33).value), (None, '未匹配'))
-        finally:
-            book.close()
-        self.assertEqual(hashes, {p: hashlib.sha256(p.read_bytes()).digest() for p in hashes})
 
     def test_fuzzy_pass_obeys_source_filters_and_does_not_reuse_matched_sources(self):
         source = self.write_source([['已用整句台词', '不能再次模糊使用'],
@@ -738,9 +687,9 @@ class TranslationMatches(unittest.TestCase):
         book = load_workbook(result.destination / '匹配明细.xlsx')
         rows = list(book['匹配明细'].values)[1:]
         self.assertEqual(sum(r[23] == TAIL_MATCH for r in rows), 6)
-        unused = {r[4]: r[8] for r in list(book['未推荐明细'].values)[1:]}
+        unused = {r[4]: r[-1] for r in list(book['未推荐明细'].values)[1:]}
         self.assertIn('找到了但不符合推荐规则', unused['保持（新说明）'])
-        self.assertEqual(unused['中（注）间'], '相似度低于80%推荐阈值，仅供人工复核')
+        self.assertIn('找不到', unused['中（注）间'])
         book.close()
         self.assertEqual(hashes, {p: hashlib.sha256(p.read_bytes()).digest() for p in hashes})
         for original, expected in [('甲（乙(丙)）', '甲'), ('甲（乙）丁', '甲（乙）丁'),
@@ -959,7 +908,7 @@ class TranslationMatches(unittest.TestCase):
         book = load_workbook(result.destination / '匹配明细.xlsx')
         sheet = book['未推荐明细']
         records = list(sheet.values)
-        self.assertEqual(records[0][:9], ('源文件名','源完整路径','源 Sheet','源行号','源中文','韩语','命中基准','缺译','未推荐原因'))
+        self.assertEqual(records[0], ('源文件名','源完整路径','源 Sheet','源行号','源中文','韩语','命中基准','缺译','未推荐原因'))
         rows = {(r[0], r[3]): r for r in records[1:]}
         self.assertEqual(set(rows), {('A.xlsx', i) for i in range(4, 9)} | {('B.xlsx', 2), ('B.xlsx', 3)})
         self.assertEqual(len(records) - 1, len(rows))
@@ -976,7 +925,7 @@ class TranslationMatches(unittest.TestCase):
         self.assertEqual(sheet.cell(formula_row, 5).data_type, 's')
         self.assertEqual(sheet.cell(formula_row, 6).data_type, 's')
         self.assertEqual(sheet.freeze_panes, 'A2')
-        self.assertEqual(sheet.auto_filter.ref, 'A1:O8')
+        self.assertEqual(sheet.auto_filter.ref, 'A1:I8')
         book.close()
 
     def test_unrecommended_details_exclude_recommended_pairs_across_files_and_rounds(self):
@@ -1014,9 +963,8 @@ class TranslationMatches(unittest.TestCase):
         result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
         book = load_workbook(result.destination / '匹配明细.xlsx')
         self.assertEqual(list(book['未推荐明细'].values),
-                         [('源文件名','源完整路径','源 Sheet','源行号','源中文','韩语','命中基准','缺译','未推荐原因',
-                           '相似度','基准中文','基准文件名','基准完整路径','基准 Sheet','基准行号')])
-        self.assertEqual(book['未推荐明细'].auto_filter.ref, 'A1:O1')
+                         [('源文件名','源完整路径','源 Sheet','源行号','源中文','韩语','命中基准','缺译','未推荐原因')])
+        self.assertEqual(book['未推荐明细'].auto_filter.ref, 'A1:I1')
         book.close()
 
     def test_context_recommends_per_baseline_and_keeps_full_evidence(self):

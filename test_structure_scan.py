@@ -698,6 +698,22 @@ class StructureScanTests(unittest.TestCase):
         self.assertIn('已定位2/3段', unresolved[0][-1])
         self.assertEqual(hashes, {p: hashlib.sha256(p.read_bytes()).digest() for p in hashes})
 
+    def test_legacy_merge_and_split_take_priority_over_new_punctuation_whole_matches(self):
+        self.workbook(self.source, [
+            ['台词', '한국어'], ['前锚', '앞'], ['甲…', '가...'], ['乙！', '나!'], ['后锚', '뒤'],
+            ['丙…\n丁！', '다...\n라!'],
+        ], name='旧来源.xlsx')
+        self.workbook(self.source, [['台词', '한국어'], ['甲...乙！', '新增整句'], ['丙...', '新增单句']], name='新来源.xlsx')
+        self.workbook(self.baseline, [['Text'], ['前锚'], ['甲…乙！'], ['后锚'], ['丙…'], ['丁！']])
+        result, _ = self.scan()
+        book = load_workbook(result.match_report.destination / '基准匹配结果/char.xlsx')
+        self.assertEqual((book.active['AD3'].value, book.active['AG3'].value), ('가... 나!', '合并推荐·待复核'))
+        self.assertEqual((book.active['AD5'].value, book.active['AG5'].value), ('다...', '拆分推荐·待复核'))
+        self.assertIn('v1.1.9规则优先', book.active['AF3'].value)
+        self.assertIn('v1.1.9规则优先', book.active['AF5'].value)
+        book.close()
+        self.assertEqual(result.match_report.recommended_rows, 5)
+
     def test_trailing_whole_matches_prevent_false_merge_and_unresolved(self):
         self.workbook(self.source, [['台词', '한국어'], ['你好（小声）', '안녕 (작게)'], ['你', '너'], ['好', '좋아'],
                                    ['完整（注）', 'full'], ['中（注）间', '중']])

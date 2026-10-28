@@ -313,14 +313,14 @@ def load_records(db, report, candidates, baselines, skipped, progress):
 
 def index_whole_matches(db, progress):
     """Share exact/plain/breath keys; retain both ends of whole-sentence matches."""
-    progress("先检查全部基准的整句匹配；合并反查仅处理 char.xlsx 中未命中的行")
+    progress("先按v1.1.9检查整句匹配；合并反查仅处理 char.xlsx 中未命中的行")
     db.execute("""CREATE TEMP TABLE whole_source_keys
         (record_id INTEGER PRIMARY KEY,exact TEXT,plain TEXT,breath TEXT,breath_plain TEXT,korean TEXT)""")
     for source in db.execute("SELECT id,original,korean,note FROM records WHERE kind='source'"):
         breath = breath_key(source["original"]) if source["note"] == "气息" else ""
         db.execute("INSERT INTO whole_source_keys VALUES (?,?,?,?,?,?)",
-                   (source["id"], match_key(source["original"]), plain_key(source["original"]),
-                    breath, plain_key(breath), source["korean"].strip()))
+                   (source["id"], match_key(source["original"]), plain_key(source["original"], punctuation=False),
+                    breath, plain_key(breath, punctuation=False), source["korean"].strip()))
     db.executescript("""
         CREATE INDEX whole_exact ON whole_source_keys(exact);
         CREATE INDEX whole_plain ON whole_source_keys(plain);
@@ -329,7 +329,7 @@ def index_whole_matches(db, progress):
     """)
     for baseline in db.execute("SELECT id,original FROM records WHERE kind='baseline'"):
         for plain in (False, True):
-            key = plain_key(baseline["original"]) if plain else match_key(baseline["original"])
+            key = plain_key(baseline["original"], punctuation=False) if plain else match_key(baseline["original"])
             if not key:
                 continue
             column, breath_column = ("plain", "breath_plain") if plain else ("exact", "breath")
@@ -354,7 +354,7 @@ def index_whole_matches(db, progress):
             db.execute("INSERT INTO whole_tail_keys VALUES (?,?)", (source["record_id"], key))
     db.execute("CREATE INDEX whole_tail_text ON whole_tail_keys(text)")
     for baseline in db.execute("SELECT id,original FROM records WHERE kind='baseline'"):
-        matches = list(db.execute("SELECT source_id FROM whole_tail_keys WHERE text=?", (plain_key(baseline["original"]),)))
+        matches = list(db.execute("SELECT source_id FROM whole_tail_keys WHERE text=?", (plain_key(baseline["original"], punctuation=False),)))
         if not matches:
             continue
         db.executemany("INSERT OR IGNORE INTO whole_match_pairs VALUES (?,?)", [(baseline["id"], r[0]) for r in matches])

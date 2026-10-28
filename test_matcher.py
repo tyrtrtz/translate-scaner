@@ -11,7 +11,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
 
 from ignored_sheets import sheet_key
-from matcher import TAIL_MATCH, align_boundary_newlines, breath_key, match_folder, plain_key, trailing_note_key, write_detail_sheet
+from matcher import PUNCT_MATCH, TAIL_MATCH, align_boundary_newlines, breath_key, match_folder, plain_key, trailing_note_key, write_detail_sheet
 from scanner import scan_folder
 
 
@@ -88,7 +88,9 @@ class TranslationMatches(unittest.TestCase):
         self.assertEqual((sheet['AG4'].value, sheet['AB4'].value), ('全部缺译', 1))
         self.assertEqual(sheet['AG5'].value, '未匹配')
         self.assertEqual((sheet['AD6'].value, sheet['AG6'].value), ('整句译文', '唯一译文'))
-        self.assertEqual((sheet['AD7'].value, sheet['AG7'].value, sheet['AA7'].value), (None, '待确认', 2))
+        self.assertEqual((sheet['AD7'].value, sheet['AG7'].value, sheet['AA7'].value), (None, '待确认', 3))
+        self.assertIn('保留旧规则候选共同判断', sheet['AF7'].value)
+        self.assertNotIn('相似度 100.0%', sheet['AF7'].value)
         self.assertEqual(sheet['AG8'].value, '未匹配')
         book.close()
         book = load_workbook(result.destination / '基准匹配结果/another.xlsx')
@@ -97,7 +99,7 @@ class TranslationMatches(unittest.TestCase):
         book = load_workbook(result.destination / '匹配明细.xlsx')
         rows = list(book['匹配明细'].values)
         candidates = [dict(zip(rows[0], r)) for r in rows[1:] if r[23] == '模糊匹配']
-        self.assertEqual(len(candidates), 9)
+        self.assertEqual(len(candidates), 10)
         chosen = [r for r in candidates if r['推荐来源'] == '是']
         self.assertEqual(len(chosen), 2)
         self.assertTrue(all(r['源中文'] == repeated and r['基准中文'] == target for r in chosen))
@@ -143,7 +145,8 @@ class TranslationMatches(unittest.TestCase):
         book = load_workbook(result.destination / '匹配明细.xlsx')
         try:
             details = list(book['匹配明细'].values)[1:]
-            self.assertTrue(all(r[23] == '纯文本补匹配' and r[28] is None for r in details if r[3] <= 11))
+            self.assertTrue(all(r[23] == PUNCT_MATCH and r[28] is None for r in details if r[3] <= 10))
+            self.assertTrue(all(r[23] == '纯文本补匹配' for r in details if r[3] == 11))
             self.assertEqual({r[8] for r in details if r[3] <= 9}, {r[0] for r in rows[:8]})
         finally:
             book.close()
@@ -168,6 +171,77 @@ class TranslationMatches(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(actual[('甲乙', '甲乙补')], .8)
         self.assertEqual(actual[('丙丁戊己', '丙丁戊己补充')], .8)
+        book.close()
+
+    def test_legacy_plain_and_tail_recommendations_lock_before_new_rules(self):
+        self.write_source([['<b>这句话，应该优先…</b>', '旧纯文本译文']], name='旧纯文本.xlsx')
+        self.write_source([['这句话,应该优先...', '新规则会选其他来源'],
+                           ['随后甲', '甲'], ['随后乙', '乙'], ['随后丙', '丙']], name='新候选.xlsx')
+        self.write_source([['末尾，保留…（轻声）', '旧句尾译文'],
+                           ['末尾,保留...', '新整句译文'], ['只差,标点...', '标点补齐'],
+                           ['这是一句需要稍微修改的长句啊', '模糊补齐']], name='其他.xlsx')
+        for filename, texts in (
+            ('A.xlsx', ['这句话，应该优先…', '随后甲', '随后乙', '随后丙']),
+            ('B.xlsx', ['末尾，保留…']), ('C.xlsx', ['只差，标点…']),
+            ('D.xlsx', ['这是一句需要稍微修改的长句呀']),
+            ('E.xlsx', ['这句话，应该优先…']),
+        ):
+            self.write_baseline(texts, filename)
+        result = match_folder(scan_folder(self.source), self.baseline, self.output)
+        for filename, korean, stage, source in (
+            ('A.xlsx', '旧纯文本译文', 'v1.1.9规则优先', '旧纯文本.xlsx'),
+            ('B.xlsx', '旧句尾译文', 'v1.1.9规则优先', '其他.xlsx'),
+            ('C.xlsx', '标点补齐', 'v1.1.12规则补匹配', '其他.xlsx'),
+            ('D.xlsx', '模糊补齐', 'v1.1.12规则补匹配', '其他.xlsx'),
+            ('E.xlsx', '旧纯文本译文', 'v1.1.9规则优先', '旧纯文本.xlsx'),
+        ):
+            with self.subTest(filename=filename):
+                book = load_workbook(result.destination / '基准匹配结果' / filename)
+                self.assertEqual(book.active['AD2'].value, korean)
+                self.assertIn(stage, book.active['AF2'].value)
+                self.assertIn(source, book.active['AE2'].value)
+                book.close()
+        book = load_workbook(result.destination / '匹配明细.xlsx')
+        rows = list(book['匹配明细'].values)[1:]
+        self.assertFalse(any(r[0] in ('A.xlsx', 'E.xlsx') and r[3] == 2 and r[9] != '旧纯文本译文' for r in rows))
+        self.assertFalse(any(r[0] == 'B.xlsx' and r[9] == '新整句译文' for r in rows))
+        book.close()
+        self.assertEqual(result.recommended_rows, 8)
+
+    def test_new_rules_resolve_pending_with_old_candidates_and_preserve_occurrence_priority(self):
+        self.write_source([['冲突，句子…', '旧候选甲'], ['后句，第一…', '甲'],
+                           ['后句；第二', '乙'], ['后句：第三', '丙']], name='A.xlsx')
+        self.write_source([['冲突，句子…', '旧候选乙']], name='B.xlsx')
+        self.write_source([['冲突,句子...', '新增候选'],
+                           ['尾部冲突，句子…（甲）', '尾甲'], ['尾部冲突，句子…（乙）', '尾乙'],
+                           ['尾部冲突,句子...', '尾丙'],
+                           ['这段相同的中文没有译文啊', None], ['这段相同的中文没有译文呀', '补缺译']], name='C.xlsx')
+        self.write_baseline(['冲突，句子…', '后句，第一…', '后句；第二', '后句：第三'], '旧阶段.xlsx')
+        self.write_baseline(['冲突，句子…', '后句,第一...', '后句;第二', '后句:第三'], '新阶段.xlsx')
+        self.write_baseline(['尾部冲突，句子…'], '尾部.xlsx')
+        self.write_baseline(['这段相同的中文没有译文啊'], '缺译.xlsx')
+        result = match_folder(scan_folder(self.source), self.baseline, self.output)
+        for filename, stage, count in (('旧阶段.xlsx', 'v1.1.9规则优先', 2), ('新阶段.xlsx', 'v1.1.12规则补匹配', 3)):
+            book = load_workbook(result.destination / '基准匹配结果' / filename)
+            self.assertEqual((book.active['AD2'].value, book.active['AG2'].value), ('旧候选甲', '上下文推荐'))
+            self.assertIn(stage, book.active['AF2'].value)
+            self.assertEqual(book.active['AA2'].value, count)
+            book.close()
+        book = load_workbook(result.destination / '基准匹配结果/尾部.xlsx')
+        self.assertIsNone(book.active['AD2'].value)
+        self.assertEqual(book.active['AG2'].value, '待确认')
+        self.assertGreaterEqual(book.active['AA2'].value, 3)
+        book.close()
+        book = load_workbook(result.destination / '基准匹配结果/缺译.xlsx')
+        self.assertEqual((book.active['AD2'].value, book.active['AG2'].value), ('补缺译', '模糊推荐·待复核'))
+        self.assertEqual((book.active['AA2'].value, book.active['AB2'].value), (2, 1))
+        book.close()
+        book = load_workbook(result.destination / '匹配明细.xlsx')
+        rows = list(book['匹配明细'].values)[1:]
+        self.assertEqual({r[9] for r in rows if r[0] == '新阶段.xlsx' and r[3] == 2}, {'旧候选甲', '旧候选乙', '新增候选'})
+        self.assertTrue(all('v1.1.12标点等价重评上下文' in r[26]
+                            for r in rows if r[0] == '新阶段.xlsx' and r[3] == 2))
+        self.assertTrue({'尾甲', '尾乙', '尾丙'} <= {r[9] for r in rows if r[0] == '尾部.xlsx'})
         book.close()
 
     def test_fuzzy_pass_obeys_source_filters_and_does_not_reuse_matched_sources(self):

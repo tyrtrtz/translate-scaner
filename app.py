@@ -521,7 +521,7 @@ class Application:
         summary_frame.columnconfigure(0, weight=1)
         self.match_summary.trace_add("write", self.render_match_summary)
         self.render_match_summary()
-        self.match_rules_label = ttk.Label(match_content, text="结果写入副本；最后以 80% 为下限补查模糊匹配，模糊推荐标明待复核。", style="CardMuted.TLabel", wraplength=620, justify="left")
+        self.match_rules_label = ttk.Label(match_content, text="先按 v1.1.9 规则推荐；未推荐的再按 v1.1.12 规则补查，保留旧候选，不覆盖已有推荐。", style="CardMuted.TLabel", wraplength=620, justify="left")
         self.match_rules_label.pack(side="bottom", anchor="w", fill="x", pady=(4, 0), before=summary_frame)
         match_content.bind("<Configure>", self.resize_match_text)
 

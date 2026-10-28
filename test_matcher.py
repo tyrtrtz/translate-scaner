@@ -597,6 +597,58 @@ class TranslationMatches(unittest.TestCase):
         self.assertIn('多个特殊说明列', scan_folder(self.source, 1).exceptions[0].issue)
         self.assertEqual(scan_folder(self.source, 1, include_deprecated=True).passed_sheets, 1)
 
+    def test_optional_metadata_keeps_correct_candidates_and_korean_deprecation_is_shared(self):
+        texts = ['前甲', '前乙', '前丙', '同一句正文', '后甲', '后乙', '后丙']
+        source = self.write_source([[t, '올바른 번역'] for t in texts], name='有效台本.xlsx')
+        book = load_workbook(source)
+        sheet = book.active
+        sheet['C1'], sheet['D1'], sheet['E1'] = '特殊说明', '说话角色名', '备注'
+        sheet['D2'] = '="主角"'  # Optional speaker formulas must not discard the Sheet.
+        sheet.append(['公式备注待处理', '임시', None, None, '=1+1'])
+        sheet.append(['公式说明待处理', '임시', '=1+1'])
+        sheet.append(['正常旁白', '해설', None, None, '非废弃'])
+        book.save(source); book.close()
+        for header in ('特殊说明', '备注', '비고'):
+            for marker in ('废弃', '폐기'):
+                old = self.write_source([['同一句正文', '이전 번역', '对话', '主角', marker]],
+                                        name=f'旧台本-{header}-{marker}.xlsx')
+                book = load_workbook(old)
+                book.active['C1'], book.active['D1'] = '特殊说明', '说话角色名'
+                if header == '特殊说明':
+                    book.active['C2'], book.active['E2'] = marker, None
+                else:
+                    book.active['E1'] = header
+                book.save(old); book.close()
+        baseline = self.write_baseline([*texts, '正常旁白'])
+        originals = [*self.source.glob('*.xlsx'), baseline]
+        before = {p: hashlib.sha256(p.read_bytes()).digest() for p in originals}
+        for include in (False, True):
+            with self.subTest(include=include):
+                result = match_folder(scan_folder(self.source, include_deprecated=include), self.baseline, self.output)
+                self.assertEqual(result.source_rows, 15 if include else 8)
+                self.assertEqual(result.skipped, 0)  # Formula notes are isolated to their own rows.
+                book = load_workbook(result.destination / '基准匹配结果/story.xlsx')
+                self.assertEqual(book.active['AD5'].value, '올바른 번역')
+                self.assertEqual(book.active['AG5'].value, '上下文推荐' if include else '唯一译文')
+                self.assertIn('上下各3句有效台词一致', book.active['AF5'].value)
+                self.assertIn('候选7条，非空韩语2种' if include else '候选1条，非空韩语1种', book.active['AF5'].value)
+                book.close()
+                book = load_workbook(result.destination / '匹配明细.xlsx')
+                excluded = list(book['上下文排除明细'].values)[1:]
+                self.assertEqual(len(excluded), 1 if include else 8)
+                self.assertTrue(any(r[2] == 10 and 'C10' in r[-1] and '仅跳过本行' in r[-1] for r in excluded))
+                if not include:
+                    self.assertTrue(any('폐기' in r[-1] for r in excluded))
+                    self.assertFalse(any('이전 번역' in str(r) for r in book['匹配明细'].values))
+                book.close()
+                book = load_workbook(result.destination / '源文件匹配统计.xlsx')
+                settings = dict(list(book['扫描说明'].values)[1:])
+                self.assertEqual(settings['包含废弃行'], '是' if include else '否')
+                self.assertEqual(settings['源文件夹'], str(self.source.resolve()))
+                self.assertTrue(settings['程序版本'])
+                book.close()
+        self.assertEqual(before, {p: hashlib.sha256(p.read_bytes()).digest() for p in originals})
+
     def test_plain_tag_fallback_preserves_values_exact_priority_and_statistics(self):
         first = self.write_source([['这是基准文件的原文','<color=#3266b4>번역</color>'],
                                    ['{playername}你好\\n世界','이름{playername}\\n원문'],
@@ -1055,7 +1107,7 @@ class TranslationMatches(unittest.TestCase):
                 sheet.append(["前1", "译文", "", "角色"])
                 sheet.append(["前2", "译文", "", "角色"])
                 sheet.append(["前3", "译文", "奇波", "角色"])
-                sheet.append(["场景说明", "설명", "", ""])
+                sheet.append(["场景说明", "설명", "演出", ""])
                 sheet.append(["嗯？（惊讶）", "응? (놀람)", " 气息 ", "角色"])
                 for _ in range(9):
                     sheet.append([None, None, "演出", None])
@@ -1086,9 +1138,9 @@ class TranslationMatches(unittest.TestCase):
                 self.assertEqual(selected["完美匹配"], "是")
                 self.assertEqual(selected["匹配方式"], "纯文本补匹配" if plain else "全文精确匹配")
                 self.assertEqual(selected["上下文查询统计"],
-                    "向上：查询13行，演出9行，气息1行，匹配3句\n"
+                    "向上：查询14行，演出10行，气息1行，匹配3句\n"
                     "向下：查询6行，演出1行，气息2行，匹配3句\n"
-                    "合计（不含当前句）：查询19行，演出10行，气息3行，匹配6句")
+                    "合计（不含当前句）：查询20行，演出11行，气息3行，匹配6句")
                 self.assertEqual(selected["来源前3句"], "前1句 [行4] 前3\n前2句 [行3] 前2\n前3句 [行2] 前1")
                 self.assertEqual(selected["来源后3句"], "后1句 [行19] 后1\n后2句 [行21] 后2\n后3句 [行22] 后3")
                 self.assertIn("同时越过基准行5", selected["上下文跳过位置"])
@@ -1096,7 +1148,7 @@ class TranslationMatches(unittest.TestCase):
                 self.assertNotIn("场景说明", str(values))
                 excluded = list(book["上下文排除明细"].values)[1:]
                 self.assertEqual(len(excluded), 14)
-                self.assertTrue(any(r[2] == 5 and "两列均为空" in r[-1] for r in excluded))
+                self.assertTrue(any(r[2] == 5 and "上下文不计有效句" in r[-1] for r in excluded))
                 book.close()
                 book = load_workbook(result.destination / "基准匹配结果/story.xlsx")
                 self.assertEqual(book.active["AD6"].value, "正确")
@@ -1158,9 +1210,7 @@ class TranslationMatches(unittest.TestCase):
     def test_context_metadata_validation_rolls_back_all_evidence(self):
         self.write_source([["安全", "번역"]], name="安全.xlsx")
         self.write_baseline(["安全", "失败"])
-        for metadata in (("C3", "=1+1", "特殊说明含公式"),
-                         ("D3", "=1+1", "说话角色名含公式"),
-                         ("E1", "特殊说明", "多个特殊说明列"),
+        for metadata in (("E1", "特殊说明", "多个特殊说明列"),
                          ("E1", "说话角色名", "多个说话角色名列")):
             with self.subTest(metadata=metadata):
                 path = self.write_source([["先读的气息(动作)", "译文", "气息", "角色"],

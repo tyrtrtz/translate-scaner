@@ -25,6 +25,7 @@ from openpyxl.utils import get_column_letter
 
 from ignored_sheets import sheet_key
 from scanner import SUPPORTED, hidden_row_numbers, normalize, scan_folder
+from updater import VERSION
 
 
 def match_key(value):
@@ -60,21 +61,25 @@ def source_metadata_columns(header):
         if len(found) > 1:
             raise ValueError(f"存在多个{name}列，无法判断上下文清理规则")
         columns.append(found[0] if found else None)
-    return tuple(columns)
+    remarks = tuple(c.column for c in header if normalize(c.value) in {"备注", "비고"})
+    return *columns, remarks
 
 
-def source_row_metadata(note, speaker, number, include_deprecated):
+def source_row_metadata(note, speaker, include_deprecated, remarks=()):
     """Share source eligibility between matching and structural discovery."""
-    if note is not None and note.data_type == "f":
-        raise ValueError(f"第 {number} 行特殊说明含公式，无法判断上下文规则，请先转成文本值")
     note_text = normalize(str(note.value)) if note is not None and note.value is not None else ""
-    if not include_deprecated and note_text == "废弃":
-        return note_text, "", "废弃"
-    if note is not None and not note_text and speaker is not None and speaker.data_type == "f":
-        raise ValueError(f"第 {number} 行说话角色名含公式，无法判断是否为无效信息，请先转成文本值")
     speaker_text = normalize(str(speaker.value)) if speaker is not None and speaker.value is not None else ""
-    invalid = note is not None and speaker is not None and not note_text and not speaker_text
-    return note_text, speaker_text, "无效说明" if invalid else ""
+    markers = ([note] if note is not None else []) + list(remarks)
+    if not include_deprecated:
+        for cell in markers:
+            if cell.data_type != "f" and normalize(cell.value) in {"废弃", "폐기"}:
+                return note_text, speaker_text, f"废弃：{cell.coordinate}={normalize(cell.value)}（未勾选包含废弃行）"
+    # Unknown note formulas affect this row only. Speaker metadata is optional;
+    # missing names/notes do not make otherwise valid Chinese/Korean invalid.
+    for cell in markers:
+        if cell.data_type == "f" and (cell is note or not include_deprecated):
+            return note_text, speaker_text, f"说明字段 {cell.coordinate} 含公式，无法判断标记；仅跳过本行，请先转成文本值"
+    return note_text, speaker_text, ""
 
 
 def breath_key(value):
@@ -629,6 +634,8 @@ def build_recommendations(connection, progress=None):
             else:
                 status = "上下文推荐"
                 basis = f"前{best_previous}/3句一致，后{best_following}/3句一致；完整一致侧数{best_score[0]}，一致位置数{best_score[1]}"
+            if count and count[0]:
+                basis += f"；参与本轮匹配的候选{count[0]}条，非空韩语{count[2]}种（仅统计参与扫描且通过过滤的来源）"
             if best_id is not None:
                 basis += "；完美匹配：上下各3句有效台词一致" if best_score[0] == 2 else "；非完美匹配：上下未同时各满足3句"
                 breath = connection.execute(f"SELECT {column},{breath_column} FROM source_rows WHERE rowid=?", (best_id,)).fetchone()
@@ -937,13 +944,24 @@ def issue_counts(connection, path, sheet=None):
     """, arguments).fetchone()
 
 
-def write_statistics(destination, file_rows, sheet_rows, skipped):
+def write_statistics(destination, file_rows, sheet_rows, skipped, report, baseline_root):
     book = Workbook()
     book.remove(book.active)
     for title, headers, rows, widths in (
         ("文件统计", ["文件名", "完整路径", "参与 Sheet 数", "跳过 Sheet / 文件项数", "非空中文行数", "匹配行数", "未匹配行数", "匹配率", "处理状态", "缺译行数", "冲突中文数"], file_rows, [38, 70, 18, 24, 18, 18, 18, 16, 24,18,18]),
         ("Sheet统计", ["文件名", "完整路径", "Sheet", "非空中文行数", "匹配行数", "未匹配行数", "匹配率", "缺译行数", "冲突中文数"], sheet_rows, [38, 70, 30, 18, 18, 18, 16,18,18]),
         ("跳过清单", ["文件名", "完整路径", "Sheet", "跳过原因"], skipped, [38, 70, 30, 85]),
+        ("扫描说明", ["项目", "本次设置"], [
+            ["程序版本", VERSION], ["源文件夹", str(report.root)], ["基准文件夹", str(baseline_root)],
+            ["表头检查行数", report.header_rows], ["中文表头", "、".join(report.chinese_headers)],
+            ["韩语表头", "、".join(report.korean_headers)],
+            *[[label, "是" if value else "否"] for label, value in (
+                ("包含子文件夹", report.recursive), ("包含隐藏工作表", report.include_hidden_sheets),
+                ("包含隐藏行", report.include_hidden_rows), ("包含废弃行", report.include_deprecated))],
+            ["本地忽略 Sheet 数", report.ignored_sheets],
+            ["候选范围", "唯一译文仅指实际参与候选的非空韩语只有一种；未扫描或被排除的来源不参与判断。"],
+            ["排除记录", "整文件/Sheet 见跳过清单；废弃、说明公式、隐藏行及上下文跳过见匹配明细.xlsx 的上下文排除明细。"],
+        ], [28, 100]),
     ):
         sheet = book.create_sheet(title)
         for row_number, values in enumerate([headers, *rows], 1):
@@ -1097,31 +1115,31 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                             total = matched = sequence = 0
                             columns = [result.chinese_column, result.korean_column]
                             header = next(sheet.iter_rows(min_row=result.header_row, max_row=result.header_row))
-                            metadata_columns = source_metadata_columns(header)
-                            notes_column, speaker_column = metadata_columns
-                            columns.extend(c for c in metadata_columns if c)
+                            notes_column, speaker_column, remarks_columns = source_metadata_columns(header)
+                            columns.extend(c for c in (notes_column, speaker_column, *remarks_columns) if c)
                             first, last = min(columns), max(columns)
                             for number, row in enumerate(sheet.iter_rows(min_row=result.header_row + 1,
                                                                         min_col=first, max_col=last), result.header_row + 1):
                                 chinese = row[result.chinese_column - first]
                                 korean = row[result.korean_column - first]
-                                if number in hidden_rows:
-                                    continue
                                 note = row[notes_column - first] if notes_column else None
                                 speaker = row[speaker_column - first] if speaker_column else None
-                                note_text, speaker_text, excluded = source_row_metadata(
-                                    note, speaker, number, report.include_deprecated)
-                                if excluded == "废弃":
-                                    continue
-                                invalid = excluded == "无效说明"
-                                if (invalid and match_key(chinese.value)) or note_text in CONTEXT_SKIP_NOTES:
+                                if number in hidden_rows:
+                                    note_text = str(note.value) if note is not None and note.value is not None else ""
+                                    speaker_text = str(speaker.value) if speaker is not None and speaker.value is not None else ""
+                                    excluded = "隐藏行（未勾选包含隐藏行）"
+                                else:
+                                    note_text, speaker_text, excluded = source_row_metadata(
+                                        note, speaker, report.include_deprecated,
+                                        [row[c - first] for c in remarks_columns])
+                                if (excluded and (match_key(chinese.value) or note_text)) or note_text in CONTEXT_SKIP_NOTES:
                                     connection.execute("INSERT INTO context_exclusions VALUES (?,?,?,?,?,?,?,?)",
                                         (str(path), sheet.title, number, chinese.value,
                                          None if korean.value is None else str(korean.value), note_text, speaker_text,
-                                         "两列均为空：从匹配与上下文排除" if invalid else
+                                         "排除本行：" + excluded if excluded else
                                          "上下文不计有效句，继续向外补查；有正文时仍参与整句匹配" +
                                          ("；比较时忽略成对括号说明" if note_text == "气息" else "")))
-                                if invalid:
+                                if excluded:
                                     continue
                                 if chinese.data_type == "f" or korean.data_type == "f":
                                     raise ValueError(f"第 {number} 行中韩文本含公式，请先转成文本值")
@@ -1212,7 +1230,7 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                 file_rows.append([Path(filename).name, filename, len(rows), skip_count, total, matched, total - matched,
                                   matched / total if total else None, "部分跳过" if rows and skip_count else "已扫描" if rows else "全部跳过",
                                   *issue_counts(connection, filename)])
-            write_statistics(staging / "源文件匹配统计.xlsx", file_rows, sheet_rows, skipped)
+            write_statistics(staging / "源文件匹配统计.xlsx", file_rows, sheet_rows, skipped, fresh, baseline_root)
             outputs.append(Path("源文件匹配统计.xlsx"))
         finally:
             connection.close()

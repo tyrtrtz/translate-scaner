@@ -175,7 +175,7 @@ def create_index(db):
 def index_sheet(db, kind, path, sheet, header_row, text_column, korean_column=None,
                 include_hidden=True, include_deprecated=False, skipped=None):
     header = next(sheet.iter_rows(min_row=header_row, max_row=header_row))
-    notes_column, speaker_column = source_metadata_columns(header) if kind == "source" else (None, None)
+    notes_column, speaker_column, remarks_columns = source_metadata_columns(header) if kind == "source" else (None, None, ())
     scenes = [c.column for c in header if normalize(c.value) in SCENE_HEADERS]
     if len(scenes) > 1:
         raise ValueError("存在多个场景列，无法确定句段边界")
@@ -185,11 +185,11 @@ def index_sheet(db, kind, path, sheet, header_row, text_column, korean_column=No
         for name, aliases in METADATA_HEADERS.items()
     }
     hidden = hidden_row_numbers(sheet.parent, sheet) if not include_hidden else set()
-    columns = [c for c in (text_column, korean_column, notes_column, speaker_column, scene_column) if c]
+    columns = [c for c in (text_column, korean_column, notes_column, speaker_column, scene_column, *remarks_columns) if c]
     columns.extend(c for matches in metadata_columns.values() for c in matches)
     first, last = min(columns), max(columns)
     previous_row, block, scene = 0, 0, ""
-    hidden_count = deprecated_count = invalid_count = empty_count = 0
+    hidden_count = deprecated_count = empty_count = 0
     for number, cells in enumerate(sheet.iter_rows(min_row=header_row + 1, min_col=first, max_col=last), header_row + 1):
         cell = lambda column: cells[column - first]
         if number in hidden:
@@ -197,10 +197,14 @@ def index_sheet(db, kind, path, sheet, header_row, text_column, korean_column=No
             continue
         note_text, _, excluded = source_row_metadata(
             cell(notes_column) if notes_column else None,
-            cell(speaker_column) if speaker_column else None, number, include_deprecated)
+            cell(speaker_column) if speaker_column else None, include_deprecated,
+            [cell(c) for c in remarks_columns])
         if excluded:
-            deprecated_count += excluded == "废弃"
-            invalid_count += excluded == "无效说明"
+            if excluded.startswith("废弃："):
+                deprecated_count += 1
+            elif skipped is not None:
+                skipped.append([path.name, str(path), sheet.title,
+                                f"第 {number} 行：{excluded}；连续窗口不跨该行"])
             continue
         if any(cell(c).data_type == "f" for c in (text_column, korean_column, scene_column) if c):
             raise ValueError(f"第 {number} 行中文、韩文或场景含公式，请先转为文本值")
@@ -240,8 +244,7 @@ def index_sheet(db, kind, path, sheet, header_row, text_column, korean_column=No
         if not comparison_key(original):
             block += 1
     if skipped is not None:
-        for count, reason in ((hidden_count, "排除隐藏行"), (deprecated_count, "排除废弃行"),
-                              (invalid_count, "排除特殊说明与说话角色名均为空的无效说明行"),
+        for count, reason in ((hidden_count, "排除隐藏行"), (deprecated_count, "排除废弃行（废弃 / 폐기）"),
                               (empty_count, "空白或非文本中文行")):
             if count:
                 skipped.append([path.name, str(path), sheet.title, f"{reason} {count} 行；连续窗口不跨这些行"])

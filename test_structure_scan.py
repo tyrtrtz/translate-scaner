@@ -164,7 +164,7 @@ class StructureScanTests(unittest.TestCase):
     def test_whole_matching_shares_source_filters_breath_and_source_coverage(self):
         self.workbook(self.source, [
             ["台词", "한국어", "特殊说明", "说话角色名"],
-            ["甲乙", "无效说明的译文", None, None],
+            ["甲乙", "가 나", None, None],
             ["甲", "가", None, "角色"], ["乙", "나", None, "角色"],
             ["哈（喘息）", "하", "气息", None],
             ["<COLOR=#3266b4>你好</COLOR>{playername}", "<b>안녕</b>", None, "角色"],
@@ -175,11 +175,10 @@ class StructureScanTests(unittest.TestCase):
         matched = match_folder(report, self.baseline, self.output)
         result, sheets = self.scan()
         self.assertEqual(result.source_rows, matched.source_rows)
-        self.assertEqual((result.whole_matched_rows, matched.matched_rows), (3, 3))
-        self.assertEqual(result.merge_candidates, 1)
-        self.assertEqual(sheets["合并候选"][1][4], "3、4")
-        self.assertFalse(sheets["未解释"][1:], "Whole matches must cover both baseline and source rows")
-        self.assertTrue(any("无效说明" in row[3] for row in sheets["跳过清单"][1:]))
+        self.assertEqual((result.whole_matched_rows, matched.matched_rows), (4, 4))
+        self.assertEqual(result.merge_candidates, 0)
+        self.assertFalse(any(row[1] == "基准" for row in sheets["未解释"][1:]))
+        self.assertFalse(any("无效说明" in row[3] for row in sheets["跳过清单"][1:]))
         book = load_workbook(result.destination / "试合并结果.xlsx", read_only=True)
         try:
             whole = {r[3]: r for r in list(book["整句命中检查"].values)[1:]}
@@ -188,6 +187,28 @@ class StructureScanTests(unittest.TestCase):
             self.assertEqual(whole["你好"][4:7], ("纯文本补匹配", 1, 1))
         finally:
             book.close()
+
+    def test_structure_filters_deprecated_aliases_and_isolates_note_formulas(self):
+        self.workbook(self.source, [
+            ['台词', '한국어', '特殊说明', '说话角色名', '비고'],
+            ['前锚', '앞'], ['甲', '가'], ['乙', '나'], ['后锚', '뒤'],
+            ['丙\n丁', '다\n라'],
+            ['甲乙', '오래된 번역', '对话', '主角', '폐기'],
+            ['丙\n丁', '옛날\n번역', None, None, '废弃'],
+            ['戊', '마'], ['未知行', '미상', '=1+1'], ['己', '바'],
+        ])
+        self.workbook(self.baseline, [['Text'], ['前锚'], ['甲乙'], ['后锚'], ['丙'], ['丁'], ['戊己']])
+        result, sheets = self.scan()
+        self.assertEqual(result.source_rows, 7)
+        self.assertEqual(result.match_report.source_rows, 7)
+        self.assertTrue(any('废弃' in r[3] for r in sheets['跳过清单'][1:]))
+        self.assertTrue(any('第 10 行' in r[3] and 'C10' in r[3] for r in sheets['跳过清单'][1:]))
+        book = load_workbook(result.match_report.destination / '基准匹配结果/char.xlsx')
+        self.assertEqual((book.active['AD3'].value, book.active['AG3'].value), ('가 나', '合并推荐·待复核'))
+        self.assertEqual((book.active['AD5'].value, book.active['AG5'].value), ('다', '拆分推荐·待复核'))
+        self.assertEqual((book.active['AD6'].value, book.active['AG6'].value), ('라', '拆分推荐·待复核'))
+        self.assertIsNone(book.active['AD7'].value)  # Do not join across an excluded formula row.
+        book.close()
 
     def test_tags_are_ignored_for_structure_comparison_and_retained_in_preview(self):
         source = self.workbook(self.source, [

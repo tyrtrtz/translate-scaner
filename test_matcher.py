@@ -800,7 +800,7 @@ class TranslationMatches(unittest.TestCase):
         hashes = {p: hashlib.sha256(p.read_bytes()).digest() for p in (source, first, second)}
         result = match_folder(scan_folder(self.source), self.baseline, self.output)
         self.assertEqual((result.baseline_rows, result.matched_rows, result.recommended_rows,
-                          result.source_matched, result.match_pairs), (8, 6, 4, 7, 8))
+                          result.source_matched, result.match_pairs), (8, 7, 5, 8, 9))
         book = load_workbook(result.destination / '基准匹配结果/story.xlsx')
         self.assertEqual(book.active['AD2'].value, '기존')
         self.assertIn('保留先前匹配阶段推荐', book.active['AF2'].value)
@@ -809,13 +809,15 @@ class TranslationMatches(unittest.TestCase):
         self.assertIn('仍需复核标签', book.active['AF3'].value)
         self.assertEqual(book.active['AG7'].value, '全部缺译')
         self.assertEqual(book.active['AG8'].value, '待确认')
+        self.assertEqual(book.active['AD4'].value, '중')
+        self.assertIn('客户规则', book.active['AF4'].value)
         book.close()
         book = load_workbook(result.destination / '匹配明细.xlsx')
         rows = list(book['匹配明细'].values)[1:]
         self.assertEqual(sum(r[23] == TAIL_MATCH for r in rows), 6)
         unused = {r[4]: r[-1] for r in list(book['未推荐明细'].values)[1:]}
         self.assertIn('找到了但不符合推荐规则', unused['保持（新说明）'])
-        self.assertIn('找不到', unused['中（注）间'])
+        self.assertNotIn('中（注）间', unused)
         book.close()
         self.assertEqual(hashes, {p: hashlib.sha256(p.read_bytes()).digest() for p in hashes})
         for original, expected in [('甲（乙(丙)）', '甲'), ('甲（乙）丁', '甲（乙）丁'),
@@ -852,10 +854,11 @@ class TranslationMatches(unittest.TestCase):
         self.write_source([['<i>争议</i>','을']], name='B.xlsx')
         self.write_baseline(['争议','缺译','唯一'])
         result = match_folder(scan_folder(self.source, 1), self.baseline, self.output)
-        self.assertEqual((result.matched_rows,result.recommended_rows,result.match_pairs), (3,1,4))
+        self.assertEqual((result.matched_rows,result.recommended_rows,result.match_pairs), (3,2,4))
         book = load_workbook(result.destination / '基准匹配结果/story.xlsx')
-        self.assertIsNone(book.active['AD2'].value)
-        self.assertEqual(book.active['AG2'].value, '待确认')
+        self.assertEqual(book.active['AD2'].value, '갑')
+        self.assertEqual(book.active['AG2'].value, '键定位推荐·待复核')
+        self.assertIn('邻近5行', book.active['AF2'].value)
         self.assertEqual(book.active['AA2'].value, 2)
         self.assertEqual(book.active['AC2'].value, '是')
         self.assertEqual(book.active['AG3'].value, '全部缺译')
@@ -864,7 +867,7 @@ class TranslationMatches(unittest.TestCase):
         book.close()
         book = load_workbook(result.destination / '匹配明细.xlsx')
         unused = list(book['未推荐明细'].values)[1:]
-        self.assertEqual(len(unused), 3)
+        self.assertEqual(len(unused), 2)
         self.assertTrue(all(r[6]=='是' and r[8]=='基准文件中找到了但不符合推荐规则' for r in unused))
         self.assertEqual(list(book['未匹配明细'].values)[1:], [])
         book.close()

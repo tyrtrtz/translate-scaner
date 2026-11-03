@@ -14,6 +14,7 @@ from scanner import export_exceptions, scan_folder
 from ignored_sheets import default_ignore_file, load_ignored, save_ignored, sheet_key
 from matcher import match_folder
 from structure_scan import scan_structure
+from compare_backfills import compare_backfills
 from settings import default_settings, load_settings, save_settings
 from updater import VERSION, can_install_updates, check_for_update, download_update, start_installation
 
@@ -459,7 +460,7 @@ class Application:
         self.baseline_folder = tk.StringVar(value=preferences["baseline_folder"])
         self.output_folder = tk.StringVar(value=preferences["output_folder"])
         self.match_inputs = []
-        for label, variable, hint in (("基准文件夹", self.baseline_folder, "按 Text 列查找中文，结合前后文推荐译文"),
+        for label, variable, hint in (("基准文件夹", self.baseline_folder, "支持 Text 或 translationKey / chs 翻译表"),
                                       ("输出文件夹", self.output_folder, "每次生成新结果；复核记录保存在此目录")):
             line = ttk.Frame(match_content, style="Card.TFrame")
             line.pack(fill="x")
@@ -479,6 +480,8 @@ class Application:
         self.match_open_button.pack(side="left", padx=8)
         self.match_details_button = ttk.Button(line, text="打开匹配明细", command=self.open_match_details, state="disabled")
         self.match_details_button.pack(side="left")
+        self.backfill_open_button = ttk.Button(line, text="纯回填结果", command=lambda: self.open_match_output("纯回填结果"), state="disabled")
+        self.backfill_open_button.pack(side="left", padx=(8, 0))
         self.structure_report = None
         self.structure_running = False
         self.review_report_file = tk.StringVar()
@@ -521,9 +524,43 @@ class Application:
         summary_frame.columnconfigure(0, weight=1)
         self.match_summary.trace_add("write", self.render_match_summary)
         self.render_match_summary()
-        self.match_rules_label = ttk.Label(match_content, text="先按 v1.1.9 规则推荐；未推荐的再按 v1.1.12 规则补查，保留旧候选，不覆盖已有推荐。", style="CardMuted.TLabel", wraplength=620, justify="left")
+        self.match_rules_label = ttk.Label(match_content, text="保留 v1.1.15 已有推荐；最后按客户 ID、角色与顺序补匹配，同时生成纯回填副本及回填日志。", style="CardMuted.TLabel", wraplength=620, justify="left")
         self.match_rules_label.pack(side="bottom", anchor="w", fill="x", pady=(4, 0), before=summary_frame)
         match_content.bind("<Configure>", self.resize_match_text)
+
+        self.compare_tab = ttk.Frame(self.tabs)
+        panel = RoundedPanel(self.compare_tab, padding=8)
+        panel.pack(fill="both", expand=True)
+        content = panel.content
+        self.tabs.add(self.compare_tab, text="回填对比")
+        ttk.Label(content, text="双方须使用同一版原始基准，独立生成回填结果。", style="Section.TLabel").pack(anchor="w", pady=(4, 10))
+        self.compare_ours = tk.StringVar()
+        self.compare_customer = tk.StringVar()
+        self.compare_result = None
+        self.compare_inputs = []
+        for label, variable in (("我方匹配结果", self.compare_ours), ("客户回填结果", self.compare_customer)):
+            ttk.Label(content, text=label, style="Card.TLabel").pack(anchor="w", pady=(8, 4))
+            line = ttk.Frame(content, style="Card.TFrame")
+            line.pack(fill="x")
+            field, entry = rounded_entry(line, variable, width=12)
+            field.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            button = ttk.Button(line, text="选文件夹", command=lambda v=variable, t=label: self.browse_match(v, t))
+            button.pack(side="left")
+            self.compare_inputs.extend((entry, button))
+            if variable is self.compare_customer:
+                button = ttk.Button(line, text="选文件", command=self.browse_customer_backfill)
+                button.pack(side="left", padx=(8, 0))
+                self.compare_inputs.append(button)
+        ttk.Label(content, text="我方目录须含“纯回填结果”和“回填日志.xlsx”；客户选择导出的 Excel 或存放它们的文件夹。", style="CardMuted.TLabel", wraplength=580, justify="left").pack(anchor="w", pady=(10, 16))
+        line = ttk.Frame(content, style="Card.TFrame")
+        line.pack(fill="x")
+        self.compare_button = ttk.Button(line, text="对比回填结果", style="Primary.TButton", command=self.start_comparison)
+        self.compare_button.pack(side="left")
+        self.compare_inputs.append(self.compare_button)
+        self.compare_open_button = ttk.Button(line, text="打开对比清单", command=self.open_comparison, state="disabled")
+        self.compare_open_button.pack(side="left", padx=8)
+        self.compare_summary = tk.StringVar(value="按键定位并逐字符比较译文；双方仅保留原值的行不会自动判为定稿。")
+        ttk.Label(content, textvariable=self.compare_summary, style="Card.TLabel", wraplength=580, justify="left").pack(anchor="w", fill="x", pady=(20, 0))
 
         self.ignored_tab = ttk.Frame(self.tabs)
         ignored_panel = RoundedPanel(self.ignored_tab, padding=6)
@@ -644,7 +681,7 @@ class Application:
         self.start_button.configure(text="正在检查…" if running and self.report is None else "开始表头检查  →")
         self.match_button.configure(text="正在检索…" if running and self.report is not None and not self.structure_running else "检索并生成结果  →")
         self.structure_button.configure(text="正在扫描…" if running and self.structure_running else "合并/拆分并生成推荐")
-        for widget in (self.start_button, self.browse_button, self.folder_entry, self.row_entry, *self.match_inputs, *self.scan_switches):
+        for widget in (self.start_button, self.browse_button, self.folder_entry, self.row_entry, *self.match_inputs, *self.compare_inputs, *self.scan_switches):
             widget.configure(state="disabled" if running else "normal")
         if self.ignore_error:
             self.start_button.configure(state="disabled")
@@ -662,6 +699,8 @@ class Application:
         self.merge_open_button.configure(state="normal" if not running and self.structure_report else "disabled")
         self.match_open_button.configure(state="normal" if not running and self.match_report else "disabled")
         self.match_details_button.configure(state="normal" if not running and self.match_report else "disabled")
+        self.backfill_open_button.configure(state="normal" if not running and self.match_report else "disabled")
+        self.compare_open_button.configure(state="normal" if not running and self.compare_result else "disabled")
         self.save_settings_button.configure(state="normal" if not running and not self.settings_error else "disabled")
         self.update_button.configure(state="disabled" if running or self.update_checking else "normal")
 
@@ -737,6 +776,44 @@ class Application:
         if folder:
             variable.set(folder)
 
+    def browse_customer_backfill(self):
+        path = filedialog.askopenfilename(title="选择客户工具导出的回填文件", filetypes=[("Excel 工作簿", "*.xlsx *.xlsm")])
+        if path:
+            self.compare_customer.set(path)
+
+    def start_comparison(self):
+        if self.running:
+            return
+        try:
+            ours, customer = self.compare_ours.get().strip(), self.compare_customer.get().strip()
+            rows = int(self.rows.get())
+            if not ours or not customer or rows < 1:
+                raise ValueError("请选择两边结果，并填写大于等于 1 的表头检查行数")
+        except ValueError as error:
+            messagebox.showerror("无法开始对比", str(error))
+            return
+        self.compare_result = None
+        self.compare_summary.set("正在对比；结果保存在我方匹配结果目录中。")
+        self.set_running(True)
+        self.progress.configure(mode="indeterminate")
+        self.progress.start(15)
+
+        def work():
+            try:
+                value = compare_backfills(ours, customer, header_rows=rows, progress=lambda text: self.events.put(("match_progress", text)))
+                self.events.put(("compare_done", value))
+            except Exception as error:
+                self.events.put(("compare_error", str(error)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def open_comparison(self):
+        if self.compare_result:
+            try:
+                open_path(self.compare_result)
+            except OSError as error:
+                messagebox.showerror("无法打开对比清单", str(error))
+
     def start_match(self, structure=False):
         if self.running or self.report is None or self.ignore_error:
             return
@@ -804,10 +881,10 @@ class Application:
             except OSError as error:
                 messagebox.showerror("无法打开扫描报告", str(error))
 
-    def open_match_output(self):
+    def open_match_output(self, subfolder=""):
         if self.match_report:
             try:
-                open_path(self.match_report.destination)
+                open_path(self.match_report.destination / subfolder)
             except OSError as error:
                 messagebox.showerror("无法打开结果文件夹", str(error))
 
@@ -876,6 +953,19 @@ class Application:
                     messagebox.showerror("检查失败", value)
                 elif kind == "match_progress":
                     self.status.set(value)
+                elif kind in ("compare_done", "compare_error"):
+                    self.progress.stop()
+                    self.progress.configure(mode="determinate", value=0)
+                    if kind == "compare_done":
+                        self.compare_result, counts = value
+                        summary = "；".join(f"{s} {counts.get(s, 0)} 行" for s in ("一致可定稿", "译文不一致", "无法对应", "待确认"))
+                        self.compare_summary.set(summary + f"。\n\n清单：{self.compare_result}")
+                        self.status.set("回填对比完成：" + summary)
+                    else:
+                        self.compare_summary.set("对比失败，未生成本次清单；请处理错误后重试。")
+                        self.status.set("回填对比未完成。")
+                        messagebox.showerror("回填对比失败", value)
+                    self.set_running(False)
                 elif kind in ("structure_done", "structure_error"):
                     self.progress.stop()
                     self.progress.configure(mode="determinate", value=0)
@@ -883,6 +973,7 @@ class Application:
                     if kind == "structure_done":
                         self.structure_report = value
                         self.match_report = value.match_report
+                        self.compare_ours.set(str(self.match_report.destination))
                         self.review_report_file.set("")
                         self.report = value.check_report
                         self.refresh_exceptions()
@@ -892,6 +983,7 @@ class Application:
                                    f"全部基准整句命中 {value.whole_matched_rows} 行；合并仅限 char.xlsx：建议 {value.merge_trial_rows} 行、待确认 {value.merge_pending_rows} 行、不适用 {value.merge_rejected_rows} 行。\n"
                                    f"试拆分 {value.trial_groups} 组 / {value.trial_segments} 条；暂不拆分 {value.trial_pending} 个源行。\n"
                                    f"已生成综合推荐：匹配 {value.match_report.matched_rows} 行，推荐 {value.match_report.recommended_rows} 行。\n"
+                                   f"纯回填结果实际更新 {value.match_report.backfilled_rows} 行译文，依据见回填日志。\n"
                                    f"结果位置：{value.destination}\n"
                                    "点击“打开结果文件夹”查看基准副本；可筛选“合并推荐·待复核”“拆分推荐·待复核”“模糊推荐·待复核”。\n"
                                    "试合并中的“复核填写”可保存后选择重跑；复核自动保存，内容变化后需重审。")
@@ -907,11 +999,13 @@ class Application:
                     self.progress.configure(mode="determinate", value=0)
                     if kind == "match_done":
                         self.match_report = value
+                        self.compare_ours.set(str(value.destination))
                         self.report = value.check_report
                         self.refresh_exceptions()
                         summary = (f"检索完成：基准 {value.baseline_files} 个文件、{value.baseline_rows} 行，匹配 {value.matched_rows} 行，推荐 {value.recommended_rows} 行；"
                                    f"源文件参与 {value.source_rows} 行，匹配 {value.source_matched} 行；跳过 {value.skipped} 项。\n"
                                    f"缺译 {value.missing_translations} 行；冲突中文 {value.conflict_texts} 条；完整匹配对应 {value.match_pairs} 条。\n"
+                                   f"纯回填结果实际更新 {value.backfilled_rows} 行译文；含待复核推荐，详见回填日志。\n"
                                    f"结果位置：{value.destination}\n逐基准统计见“基准文件匹配统计.xlsx”；源文件统计见“源文件匹配统计.xlsx”；上下文依据及各类明细见“匹配明细.xlsx”。")
                         self.match_summary.set(summary)
                         self.status.set(summary.split("\n")[0])

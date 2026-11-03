@@ -26,6 +26,7 @@ from openpyxl.utils import get_column_letter
 from ignored_sheets import sheet_key
 from scanner import SUPPORTED, hidden_row_numbers, normalize, scan_folder
 from updater import VERSION
+import key_matching
 
 
 def match_key(value):
@@ -176,6 +177,7 @@ class MatchReport:
     match_pairs: int = 0
     recommended_rows: int = 0
     baseline_files: int = 0
+    backfilled_rows: int = 0
 
 
 def baseline_sheets(workbook, path, header_rows, *, for_output=True):
@@ -186,11 +188,11 @@ def baseline_sheets(workbook, path, header_rows, *, for_output=True):
         for number, row in enumerate(sheet.iter_rows(max_row=header_rows), 1):
             headers = {cell.column: normalize(cell.value) for cell in row if cell.value is not None}
             for column, title in headers.items():
-                if title == "Text":
+                if title == "Text" or (title == "chs" and "translationKey" in headers.values()):
                     candidates.append((number, column, headers))
         location = f"{path.name} / {sheet.title}"
         if not candidates:
-            raise ValueError(f"基准表头缺失：{location} 的第 1～{header_rows} 行未找到 Text（完整名称匹配，忽略首尾空白）")
+            raise ValueError(f"基准表头缺失：{location} 的第 1～{header_rows} 行未找到 Text（或 translationKey / chs 翻译表表头；完整名称匹配，忽略首尾空白）")
         if len(candidates) > 1:
             positions = "、".join(f"{get_column_letter(column)}{row}" for row, column, _ in candidates)
             raise ValueError(f"基准表头不明确：{location} 找到多个 Text：{positions}，请保留唯一的 Text 表头")
@@ -947,6 +949,12 @@ def write_matching_details(destination, connection, progress=None):
         ["源完整路径", "源Sheet", "源行号", "源中文", "源韩文", "特殊说明", "说话角色名", "处理"],
         connection.execute("SELECT * FROM context_exclusions ORDER BY path,sheet,row"),
         [65, 25, 16, 70, 70, 20, 25, 75], progress)
+    write_detail_sheet(book, "客户规则补匹配", ["源完整路径", "源Sheet", "源行号", "源中文", "源韩语", "源角色", "基准完整路径", "基准Sheet", "基准行号", "基准键", "基准中文", "基准角色", "定位依据", "中文相似度", "处理"],
+        connection.execute("""SELECT s.path,s.sheet,s.row,s.chinese,s.korean,m.speaker,
+            b.path,b.sheet,b.row,b.key,b.text,b.speaker,a.method,a.similarity,a.outcome
+            FROM key_audit a JOIN source_rows s ON s.rowid=a.source_id JOIN key_sources m ON m.source_id=s.rowid
+            LEFT JOIN key_baselines b ON b.id=a.baseline_id ORDER BY s.rowid,b.id"""),
+        [65, 25, 14, 60, 60, 22, 65, 25, 14, 45, 60, 22, 80, 18, 60], progress)
     for title, condition in (("未匹配明细", "t.source_id IS NULL"), ("缺译明细", "s.korean_key=''"), ("译文冲突", "c.text IS NOT NULL")):
         # Conditions are fixed program constants, never user input.
         records = connection.execute(f"""
@@ -1012,7 +1020,7 @@ def write_statistics(destination, file_rows, sheet_rows, skipped, report, baseli
                 ("包含子文件夹", report.recursive), ("包含隐藏工作表", report.include_hidden_sheets),
                 ("包含隐藏行", report.include_hidden_rows), ("包含废弃行", report.include_deprecated))],
             ["本地忽略 Sheet 数", report.ignored_sheets],
-            ["匹配优先级", "先按v1.1.9整句及启用的合并/拆分推荐；已推荐结果锁定。其余按v1.1.12标点等价、80%模糊补查，保留旧候选。"],
+            ["匹配优先级", "先完整执行v1.1.15：v1.1.9整句及启用的合并/拆分，再v1.1.12标点等价、80%模糊补查。锁定全部已有推荐，最后按客户ID、角色、顺序及相似原文补匹配，保留旧候选。"],
             ["候选范围", "唯一译文仅指实际参与候选的非空韩语只有一种；未扫描或被排除的来源不参与判断。"],
             ["排除记录", "整文件/Sheet 见跳过清单；废弃、说明公式、隐藏行及上下文跳过见匹配明细.xlsx 的上下文排除明细。"],
         ], [28, 100]),
@@ -1129,6 +1137,7 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                 CREATE TABLE context_exclusions (
                     path TEXT,sheet TEXT,row INTEGER,chinese TEXT,korean TEXT,note TEXT,speaker TEXT,reason TEXT);
             """)
+            key_matching.init_index(connection)
             baseline_parts = {}
             for path in baselines:
                 if progress:
@@ -1137,9 +1146,20 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                 try:
                     for sheet, header_row, text_column, output_column in baseline_sheets(book, path, report.header_rows):
                         baseline_parts.setdefault(path, {})[sheet._worksheet_path.lstrip("/")] = (sheet.title, header_row, output_column)
+                        header = next(sheet.iter_rows(min_row=header_row, max_row=header_row))
+                        metadata = key_matching.metadata_columns(header)
+                        target_names = [c for c in header if normalize(c.value).lower().replace(" ", "") in {"texttrans", "translate"}]
+                        if len(target_names) > 1:
+                            raise ValueError(f"{path.name} / {sheet.title} 存在多个译文列，无法确定回填位置")
+                        schema = "translate" if normalize(header[text_column - 1].value) == "chs" else "TextTrans"
+                        new_header = "" if metadata["target"] else schema
+                        metadata["target"] = metadata["target"] or max(c.column for c in header if c.value is not None) + 1
+                        if metadata["target"] > 16384:
+                            raise ValueError(f"{path.name} / {sheet.title} 没有可用的译文列")
+                        connection.execute("INSERT INTO fill_sheets VALUES (?,?,?,?,?,?)", (str(path), sheet.title, metadata["target"], header_row, new_header, schema))
                         sequence = 0
-                        for row in sheet.iter_rows(min_row=header_row + 1, min_col=text_column, max_col=text_column):
-                            cell = row[0]
+                        for row in sheet.iter_rows(min_row=header_row + 1, max_col=max(text_column, *(c or 0 for c in metadata.values()))):
+                            cell = row[text_column - 1]
                             if cell.data_type == "f":
                                 raise ValueError(f"基准中文不能是公式：{path.name} / {sheet.title} / {cell.coordinate}")
                             key = match_key(cell.value)
@@ -1149,6 +1169,7 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                                 connection.execute("INSERT OR IGNORE INTO targets VALUES (?,?)", (key, breath_key(key)))
                                 connection.execute("INSERT INTO baseline_rows VALUES (?,?,?,?,?,?,?,?)",
                                                    (str(path), sheet.title, cell.row, key, sequence, *boundary_newlines(cell.value), plain_key(cell.value, punctuation=False)))
+                                key_matching.index_baseline(connection, path, sheet.title, row, key, metadata)
                 finally:
                     book.close()
             if not baseline_rows:
@@ -1169,9 +1190,10 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                             total = matched = sequence = 0
                             columns = [result.chinese_column, result.korean_column]
                             header = next(sheet.iter_rows(min_row=result.header_row, max_row=result.header_row))
+                            metadata = key_matching.metadata_columns(header)
                             notes_column, speaker_column, remarks_columns = source_metadata_columns(header)
                             columns.extend(c for c in (notes_column, speaker_column, *remarks_columns) if c)
-                            first, last = min(columns), max(columns)
+                            first, last = 1, max(max(columns), *(c.column for c in header if c.value is not None))
                             for number, row in enumerate(sheet.iter_rows(min_row=result.header_row + 1,
                                                                         min_col=first, max_col=last), result.header_row + 1):
                                 chinese = row[result.chinese_column - first]
@@ -1209,10 +1231,12 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                                     continue
                                 total += 1
                                 translation = None if korean.value is None else str(korean.value)
-                                connection.execute("INSERT INTO source_rows VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                                inserted = connection.execute("INSERT INTO source_rows VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                                                    (key, chinese.value, translation, str(path), sheet.title, number,
                                                     match_key(translation), sequence, plain_key(chinese.value, punctuation=False),
                                                     breath, plain_key(breath, punctuation=False)))
+                                key_matching.index_source(connection, inserted.lastrowid, path, row, metadata,
+                                                          result.chinese_column, result.korean_column, report.include_deprecated)
                                 if connection.execute("SELECT 1 FROM targets WHERE text=? OR (?!='' AND breath_text=?)",
                                                       (key, breath, breath)).fetchone():
                                     matched += 1
@@ -1255,6 +1279,9 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
             recommended_rows += apply_structure_recommendations(connection, structure_candidates)
             recommended_rows += apply_punctuation_recommendations(connection, progress)
             recommended_rows += apply_fuzzy_recommendations(connection, progress)
+            recommended_rows += key_matching.supplement(connection, progress)
+            from backfill import prepare_values, write_copy, write_log
+            prepare_values(connection)
             for row in sheet_rows:
                 row[4] = connection.execute("""SELECT COUNT(*) FROM source_rows s JOIN matched_sources m ON m.source_id=s.rowid
                     WHERE s.path=? AND s.sheet=?""", (row[1], row[2])).fetchone()[0]
@@ -1268,6 +1295,11 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 matched_rows += write_baseline_copy(path, destination, connection, baseline_parts[path])
                 outputs.append(Path("基准匹配结果") / relative)
+                write_copy(path, staging / "纯回填结果" / relative, connection, baseline_parts[path])
+                outputs.append(Path("纯回填结果") / relative)
+            write_log(staging / "回填日志.xlsx", connection, baseline_root, progress)
+            outputs.append(Path("回填日志.xlsx"))
+            backfilled_rows = connection.execute("SELECT COUNT(*) FROM fill_audit WHERE action='已回填'").fetchone()[0]
             if progress:
                 progress("写出匹配、未匹配、缺译、冲突及未推荐明细……")
             match_pairs = write_matching_details(staging / "匹配明细.xlsx", connection, progress)
@@ -1294,4 +1326,4 @@ def match_folder(report, baseline_root, output_root, ignored_sheets=(), progress
         os.rename(staging, destination)
     return MatchReport(destination, fresh, baseline_rows, matched_rows, sum(r[3] for r in sheet_rows),
                        sum(r[4] for r in sheet_rows), len(skipped), [destination / p for p in outputs],
-                       missing_translations, conflict_texts, match_pairs, recommended_rows, len(baselines))
+                       missing_translations, conflict_texts, match_pairs, recommended_rows, len(baselines), backfilled_rows)

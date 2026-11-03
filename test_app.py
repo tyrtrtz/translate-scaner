@@ -1,6 +1,7 @@
 """One desktop smoke test: layout and the check → ignore → match workflow."""
 
 import tempfile
+import shutil
 import time
 import tkinter as tk
 import unittest
@@ -92,7 +93,7 @@ class DesktopWorkflow(unittest.TestCase):
                 self.assertLessEqual(widget.winfo_y() + widget.winfo_height(), widget.master.winfo_height())
             app.tabs.select(app.match_tab)
             root.update()
-            for widget in (app.match_button, app.match_open_button, app.match_details_button):
+            for widget in (app.match_button, app.match_open_button, app.match_details_button, app.backfill_open_button):
                 self.assertGreaterEqual(widget.winfo_width(), widget.winfo_reqwidth())
                 self.assertLessEqual(widget.winfo_x() + widget.winfo_width(), widget.master.winfo_width())
 
@@ -141,6 +142,24 @@ class DesktopWorkflow(unittest.TestCase):
             self.assertIn("检索完成", app.match_summary.get())
             self.assertEqual(app.match_summary_text.cget("state"), "disabled")
             self.assertIn("检索完成", app.match_summary_text.get("1.0", "end"))
+            self.assertEqual(app.compare_ours.get(), str(app.match_report.destination))
+            customer = base / '客户回填'
+            shutil.copytree(app.match_report.destination / '纯回填结果', customer)
+            app.compare_customer.set(str(customer))
+            app.tabs.select(app.compare_tab)
+            root.update()
+            for widget in (app.compare_button, app.compare_open_button):
+                self.assertGreaterEqual(widget.winfo_width(), widget.winfo_reqwidth())
+            app.compare_button.invoke()
+            self.assertTrue(app.compare_button.instate(['disabled']))
+            self.wait_for_task(root, app)
+            self.assertTrue(app.compare_result.is_file())
+            self.assertIn('一致可定稿 1 行', app.compare_summary.get())
+            with patch('app.open_path') as opened:
+                app.compare_open_button.invoke()
+                opened.assert_called_once_with(app.compare_result)
+            app.tabs.select(app.match_tab)
+            root.update()
             self.assertEqual(load_settings(base / "settings.json")["source_folder"], str(source))
             app.structure_max_rows.set("1")
             app.structure_button.invoke()

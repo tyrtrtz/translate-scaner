@@ -724,7 +724,11 @@ class StructureScanTests(unittest.TestCase):
         self.assertNotIn('你好（小声）', [r[5] for r in sheets['未解释'][1:]])
         self.assertIn('完整', [r[5] for r in sheets['未解释'][1:]])
         matched = match_folder(scan_folder(self.source), self.baseline, self.output)
-        self.assertEqual(matched.matched_rows, result.whole_matched_rows)
+        self.assertEqual(matched.matched_rows, result.whole_matched_rows + 1)
+        book = load_workbook(matched.destination / '基准匹配结果/char.xlsx')
+        self.assertEqual(book.active['AD5'].value, '중')
+        self.assertIn('客户规则', book.active['AF5'].value)
+        book.close()
 
     def test_duplicate_candidates_and_misaligned_segment_boundaries_remain_visible(self):
         self.workbook(self.source, [["台词", "한국어"], ["甲", "가"], ["乙", "나"]])

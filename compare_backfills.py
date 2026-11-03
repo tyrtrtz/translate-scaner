@@ -10,7 +10,7 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 
-from key_matching import base, content_key, metadata_columns, records, value_at
+from key_matching import base, business_key, content_key, metadata_columns, records, value_at
 from matcher import write_detail_sheet
 from scanner import SUPPORTED, normalize
 
@@ -36,21 +36,27 @@ def index_files(db, side, root, header_rows, progress):
                     titles = {c.column: normalize(c.value) for c in row if c.value is not None}
                     text = [c for c, title in titles.items() if title == "Text" or (title == "chs" and "translationKey" in titles.values())]
                     if text:
-                        headers.append((number, text, metadata_columns(row)))
+                        columns = metadata_columns(row)
+                        if side == 1:
+                            results = [c for c, title in titles.items() if title.lower() == "html回填结果"]
+                            if results:
+                                # This named output takes priority over a retained original translation column.
+                                columns["target"] = results[0] if len(results) == 1 else None
+                        headers.append((number, text, columns))
                 if not headers:
                     db.execute("INSERT INTO skipped VALUES (?,?,?,?)", (side, rel, sheet.title, f"前{header_rows}行无 Text 或 translationKey/chs 表头"))
                     continue
                 if len(headers) != 1 or len(headers[0][1]) != 1 or not headers[0][2]["target"]:
                     raise ValueError(f"{path.name} / {sheet.title} 中文或译文表头缺失／不唯一，请先整理表头")
                 number, text, columns = headers[0]
-                for row in sheet.iter_rows(min_row=number + 1, max_col=max(text[0], columns["target"], columns["key"] or 0)):
+                for row in sheet.iter_rows(min_row=number + 1, max_col=max(text[0], columns["target"], columns["key"] or 0, columns["comment"] or 0)):
                     cn = row[text[0] - 1]
                     if cn.value is None or not str(cn.value).strip():
                         continue
                     ko = row[columns["target"] - 1]
-                    db.execute("INSERT INTO entries VALUES (NULL,?,?,?,?,?,?,?,?,?,?)", (side, identity(rel), sheet.title, cn.row,
-                        value_at(row, columns["key"]).strip(), str(cn.value), str(ko.value) if ko.value is not None else "",
-                        int(cn.data_type == "f" or ko.data_type == "f"), rel, str(path)))
+                    db.execute("INSERT INTO entries VALUES (NULL,?,?,?,?,?,?,?,?,?,?,?)", (side, identity(rel), sheet.title, cn.row,
+                        business_key(row, columns), str(cn.value), str(ko.value) if ko.value is not None else "",
+                        int(cn.data_type == "f" or ko.data_type == "f"), rel, str(path), value_at(row, columns["key"]).strip()))
         finally:
             book.close()
     if not db.execute("SELECT 1 FROM entries WHERE side=? LIMIT 1", (side,)).fetchone():
@@ -83,7 +89,7 @@ def compare_backfills(ours, customer, *, header_rows=10, progress=None):
         db = sqlite3.connect(staging / "index.sqlite3")
         try:
             db.executescript("""
-                CREATE TABLE entries (id INTEGER PRIMARY KEY,side INTEGER,rel TEXT,sheet TEXT,row INTEGER,key TEXT,text TEXT,ko TEXT,formula INTEGER,display TEXT,path TEXT);
+                CREATE TABLE entries (id INTEGER PRIMARY KEY,side INTEGER,rel TEXT,sheet TEXT,row INTEGER,key TEXT,text TEXT,ko TEXT,formula INTEGER,display TEXT,path TEXT,legacy_key TEXT);
                 CREATE INDEX entry_key ON entries(side,key);
                 CREATE INDEX entry_position ON entries(side,rel,sheet,row);
                 CREATE TABLE audit (rel TEXT,sheet TEXT,row INTEGER,key TEXT,old TEXT,new TEXT,status TEXT,action TEXT,basis TEXT,source TEXT,PRIMARY KEY(rel,sheet,row));
@@ -128,7 +134,7 @@ def compare_backfills(ours, customer, *, header_rows=10, progress=None):
                         status, reason = "待确认", "原文或译文含公式，未用公式文本代替计算结果"
                     elif a["ko"] != b["ko"]:
                         status, reason = "译文不一致", difference(a["ko"], b["ko"])
-                    elif not audit or audit["new"] != a["ko"] or audit["key"] != a["key"]:
+                    elif not audit or audit["new"] != a["ko"] or audit["key"] not in (a["key"], a["legacy_key"]):
                         status, reason = "待确认", "译文一致，但我方文件与回填日志不一致或缺少记录，不能证明本次推荐"
                     elif not a["ko"].strip():
                         status, reason = "待确认", "双方译文均为空，不视为定稿"

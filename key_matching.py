@@ -14,6 +14,7 @@ from pathlib import Path
 STORY_KEY = re.compile(r"^(story_(?:text|convenient))_(\d+)_Dialog_Detail")
 OPTION_KEY = re.compile(r"^(story_(?:text|convenient)_\d+)_Option(\d+)_")
 VOICE_KEY = re.compile(r"^char_voice_(?:words_[a-z]+_)?(\d{6})")
+COMMENT_KEY = re.compile(r"(?:story_(?:(?:text|convenient)_)?\d+|char_voice_(?:words_[a-z]+_)?\d+)(?:_[A-Za-z0-9]+)+")
 OPTION = re.compile(r"(?:^|\s)([A-Z]|\d{1,2})(?:[.．](?!\d)|[、:：;；,，])\s*")
 PLAYER = {"玩家", "主角", "主人公", "玩家(男)", "玩家(女)", "{playername}", "유저", "플레이어", "주인공", "男主角", "女主角", "星临者"}
 GENERIC_SPEAKERS = {"旁白", "系统", "系统说明", "系统文本", "系统提示", "群杂", "众人", "路人", "npc"}
@@ -95,7 +96,7 @@ def metadata_columns(header):
                 unicodedata.normalize("NFKC", c.value).strip().lower().replace(" ", "") in names]
         # Ambiguous optional metadata is never guessed.
         return cols[0] if len(cols) == 1 else None
-    return dict(key=find("translationKey", "Key", "TextKey", "ID"),
+    return dict(key=find("translationKey", "Key", "TextKey", "ID"), comment=find("Comment"),
                 speaker=find("说话角色名", "说话角色", "角色", "角色名", "speaker", "CharacterName", "Character"),
                 dialogue=find("对话ID", "台词ID"), plot=find("剧情ID"),
                 target=find("TextTrans", "translate"), note=find("特殊说明"))
@@ -106,6 +107,15 @@ def value_at(row, column):
         return ""
     cell = row[column - 1]
     return "" if cell.data_type == "f" or cell.value is None else str(cell.value)
+
+
+def business_key(row, columns):
+    """Some exports use Key for a numeric record ID and Comment for the game key."""
+    key = value_at(row, columns["key"]).strip()
+    comment = value_at(row, columns["comment"]).strip()
+    if (not key or re.fullmatch(r"\d+(?:\.0+)?", key)) and COMMENT_KEY.fullmatch(comment):
+        return comment
+    return key
 
 
 def numeric_id(value):
@@ -138,7 +148,7 @@ def init_index(db):
 
 
 def index_baseline(db, path, sheet, row, text, columns):
-    key = value_at(row, columns["key"]).strip()
+    key = business_key(row, columns)
     speaker = value_at(row, columns["speaker"]).strip()
     number = next((c.row for c in row if c.value is not None), None)
     story, option = STORY_KEY.match(key), OPTION_KEY.match(key)
@@ -291,11 +301,12 @@ def supplement(db, progress=None):
                     bases = {e["option_base"] for e in candidates(r, parts[0]) if e["option_base"]}
                     groups = [list(records(db, "SELECT * FROM key_baselines WHERE option_base=? ORDER BY option_number,id", (b,))) for b in sorted(bases)]
                 groups = [es for es in groups if len(es) == len(parts) == len(korean_parts) and
-                          [e["option_number"] for e in es] == list(range(1, len(parts) + 1)) and
+                          [e["option_number"] for e in es] in (list(range(len(parts))), list(range(1, len(parts) + 1))) and
                           all(allowed(r, e) and content_key(z, parentheses=True) == e["loose"] for z, e in zip(parts, es))]
                 if len(groups) == 1:
                     r["options"] = list(zip(groups[0], korean_parts))
                     r["method"] = "客户规则：选项按 ID 键组及逐项中文定位" if opt_id else "客户规则：选项全部中文唯一键组"
+                    r["method"] += f"；键编号 Option{groups[0][0]['option_number']}～Option{groups[0][-1]['option_number']}"
                 else:
                     r["method"] = "选项组、编号或中韩段数不唯一，保留待确认"
                 continue

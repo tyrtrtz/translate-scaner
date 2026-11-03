@@ -7,7 +7,7 @@ from zipfile import ZipFile
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 
-from key_matching import content_key, similarity, speaker_compare, option_parts
+from key_matching import business_key, content_key, metadata_columns, similarity, speaker_compare, option_parts
 from matcher import match_folder
 from scanner import scan_folder
 from compare_backfills import compare_backfills
@@ -76,6 +76,108 @@ class CustomerRules(unittest.TestCase):
         self.assertEqual([r[29] for r in rows[1:]], ['첫째', '둘째', None])
         self.assertIn('剧情ID', rows[1][31])
         self.assertEqual(self.values(result, '纯回填结果')[3][2], '保留')
+
+    def test_comment_business_keys_drive_id_matching_logs_and_customer_comparison(self):
+        self.workbook(self.source, [['台词', '한국어', '对话ID', '说话角色名'],
+            ['嗯', '첫 번째', 100, '甲'], ['嗯', '두 번째', 200, '甲']])
+        headers = ['TransComment', 'Key', 'GameKey', 'Ver', 'Status', 'Category', 'Feature',
+                   'Text', 'TransText', 'Comment', 'CategoryDesc', 'Speaker', 'SkillName',
+                   'AffiliationPrefab', 'AffiliatioinPrefabPath', 'TextTrans']
+        keys = [f'story_text_{n}_Dialog_Detail_v0' for n in (100, 200)]
+        self.workbook(self.baseline, [headers,
+            ['', 701, 'story_900000001', '', '', '', '', '嗯', '参考原译1', keys[0], '', '甲', '', '', '', '旧一'],
+            ['', 702, 'story_900000002', '', '', '', '', '嗯', '参考原译2', keys[1], '', '甲', '', '', '', '旧二']])
+        result = self.run_match()
+        rows = self.values(result)
+        self.assertEqual([r[29] for r in rows[1:]], ['첫 번째', '두 번째'])
+        self.assertTrue(all(r[32] == '键定位推荐·待复核' and '对话ID与中文一致' in r[31] for r in rows[1:]))
+        pure = self.values(result, '纯回填结果')
+        self.assertEqual([r[15] for r in pure[1:]], ['첫 번째', '두 번째'])
+        self.assertEqual([r[8] for r in pure[1:]], ['参考原译1', '参考原译2'])
+        book = load_workbook(result.destination / '回填日志.xlsx')
+        self.assertEqual([book.active.cell(i, 4).value for i in (2, 3)], keys)
+        book.close()
+
+        customer = self.root / '客户'; customer.mkdir()
+        customer_header = list(headers)
+        customer_header[15] = 'html回填结果'
+        # Different filename, order and numeric record IDs: only Comment is stable.
+        customer_rows = [list(pure[2]), list(pure[1])]
+        for i, r in enumerate(customer_rows):
+            r[1] = 900 + i
+        exported = self.workbook(customer, [customer_header, *customer_rows], name='客户导出.xlsx')
+        _, counts = compare_backfills(result.destination, exported)
+        self.assertEqual(counts, {'一致可定稿': 2})
+
+        # v1.1.16 logs used numeric Key; keep valid old logs usable after upgrading.
+        log = result.destination / '回填日志.xlsx'
+        book = load_workbook(log); book.active['D2'] = '701'; book.save(log); book.close()
+        _, counts = compare_backfills(result.destination, exported)
+        self.assertEqual(counts, {'一致可定稿': 2})
+        book = load_workbook(log); book.active['D2'] = 'unrelated-key'; book.save(log); book.close()
+        _, counts = compare_backfills(result.destination, exported)
+        self.assertEqual(counts, {'待确认': 1, '一致可定稿': 1})
+
+        # A named customer result also wins over an original TextTrans column.
+        book = load_workbook(exported); book.active['Q1'] = 'TextTrans'; book.active['Q2'] = '旧值'; book.save(exported); book.close()
+        _, counts = compare_backfills(result.destination, exported)
+        self.assertEqual(counts, {'待确认': 1, '一致可定稿': 1})
+        book = load_workbook(exported); book.active['Q1'] = 'html回填结果'; book.save(exported); book.close()
+        with self.assertRaisesRegex(ValueError, '表头缺失／不唯一'):
+            compare_backfills(result.destination, exported)
+
+    def test_comment_is_only_used_for_a_recognizable_business_key(self):
+        book = Workbook(); self.addCleanup(book.close)
+        sheet = book.active
+        sheet.append(['Key', 'Comment'])
+        key = 'story_text_100_Dialog_Detail_v0'
+        for numeric, comment, expected in [
+            (12, key, key), (12.0, key, key), (None, key, key),
+            (12, '请参考旧台本', '12'), (12, 'story_900000001', '12'),
+            (12, key + ' 请确认', '12'), (12, '=A1', '12'),
+            ('explicit-key', key, 'explicit-key'),
+            (key, 'story_text_200_Dialog_Detail_v0', key),
+        ]:
+            with self.subTest(numeric=numeric, comment=comment):
+                sheet.append([numeric, comment])
+                row = next(sheet.iter_rows(min_row=sheet.max_row, max_row=sheet.max_row))
+                self.assertEqual(business_key(row, metadata_columns(sheet[1])), expected)
+        sheet['C1'] = 'Comment'; sheet['C2'] = key
+        self.assertEqual(business_key(sheet[2], metadata_columns(sheet[1])), '12')
+
+    def test_zero_based_options_keep_segment_order_and_reject_gaps_or_duplicates(self):
+        self.workbook(self.source, [['台词', '한국어', '对话ID', '说话角色名'],
+            ['这是选项前的一句话', '앞 문장', 100, '玩家'],
+            ['1. 点头。\n2. 摇头。', '1. 끄덕인다\n2. 젓는다', None, '玩家']])
+        header = ['Key', 'Text', 'TextTrans', 'Comment', 'Speaker']
+        def baseline(numbers):
+            self.workbook(self.baseline, [header,
+                [1, '这是选项前的一句话', '旧', 'story_text_100_Dialog_Detail_v0', '{playerName}'],
+                [2, '点头。', '旧一', f'story_text_100_Option{numbers[0]}_v0', '{playerName}'],
+                [3, '摇头。', '旧二', f'story_text_100_Option{numbers[1]}_v0', '{playerName}']])
+        baseline((0, 1))
+        result = self.run_match()
+        rows = self.values(result)
+        self.assertEqual([r[29] for r in rows[1:]], ['앞 문장', '끄덕인다', '젓는다'])
+        self.assertTrue(all(r[32] == '选项推荐·待复核' and 'Option0～Option1' in r[31] for r in rows[2:]))
+        self.assertIn('选项1', rows[2][30])  # First source segment stays part 1, not whole-line part 0.
+        self.assertIn('选项2', rows[3][30])
+        self.assertEqual([r[2] for r in self.values(result, '纯回填结果')[1:]], ['앞 문장', '끄덕인다', '젓는다'])
+        book = load_workbook(result.destination / '匹配明细.xlsx')
+        self.assertEqual(list(book['未推荐明细'].values)[1:], [])
+        book.close()
+        for numbers in ((0, 2), (0, 0), (2, 3)):
+            with self.subTest(numbers=numbers):
+                baseline(numbers)
+                result = self.run_match()
+                self.assertTrue(all(r[29] is None for r in self.values(result)[2:]))
+                self.assertEqual([r[2] for r in self.values(result, '纯回填结果')[2:]], ['旧一', '旧二'])
+        baseline((0, 1))
+        source = self.source / 'table.xlsx'
+        book = load_workbook(source); book.active['B3'] = '1. 끄덕인다'; book.save(source); book.close()
+        result = self.run_match()
+        self.assertTrue(all(r[29] is None for r in self.values(result)[2:]))
+        self.assertEqual([r[2] for r in self.values(result, '纯回填结果')[2:]], ['旧一', '旧二'])
 
     def test_option_keys_write_individual_translations_and_log_full_source_coverage(self):
         self.workbook(self.source, [['台词', '한국어', '对话ID', '说话角色名'],

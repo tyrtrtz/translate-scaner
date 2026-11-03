@@ -7,7 +7,7 @@ from zipfile import ZipFile
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 
-from key_matching import business_key, content_key, metadata_columns, similarity, speaker_compare, option_parts
+from key_matching import business_key, content_key, metadata_columns, similarity, speaker_compare, option_parts, unique_alignment
 from matcher import match_folder
 from scanner import scan_folder
 from compare_backfills import compare_backfills
@@ -211,6 +211,81 @@ class CustomerRules(unittest.TestCase):
         self.assertEqual(rows[4][29], '뒤 음')
         self.assertIn('顺序', rows[2][31])
         self.assertIsNone(rows[6][29]); self.assertIsNone(rows[7][29])
+
+    def test_single_anchor_resolves_repeated_short_lines_in_order(self):
+        anchor = '这是一句可以确定位置的长台词'
+        for side, count in (('前', 2), ('后', 2), ('前', 4), ('后', 4)):
+            with self.subTest(side=side, count=count):
+                translations = [f'번역 {i}' for i in range(count)]
+                source = [['嗯。', kr, None, '玩家'] for kr in translations]
+                anchor_source = [anchor, '기준 대사', 100 if side == '前' else 101 + count, '玩家']
+                source.insert(0 if side == '前' else len(source), anchor_source)
+                self.workbook(self.source, [['台词', '한국어', '对话ID', '说话角色名'], *source])
+                targets = [[f'story_text_{n}_Dialog_Detail_v0', '嗯', '原值', '{playerName}'] for n in range(101, 101 + count)]
+                anchor_target = [f'story_text_{anchor_source[2]}_Dialog_Detail_v0', anchor, '原锚点', '{playerName}']
+                targets.insert(0 if side == '前' else len(targets), anchor_target)
+                # Same Chinese in another scene must not receive these short translations.
+                targets.append(['story_text_900_Dialog_Detail_v0', '嗯', '另一场景', '{playerName}'])
+                self.workbook(self.baseline, [['translationKey', 'chs', 'translate', 'speaker'], *targets])
+                result = self.run_match()
+                rows = self.values(result)[1:]
+                short_rows = [r for r in rows if r[1] == '嗯' and '900_' not in r[0]]
+                self.assertEqual([r[29] for r in short_rows], translations)
+                if count == 4:
+                    self.assertTrue(all(f'{side}侧确定键' in r[31] and '15个ID' in r[31] and r[32] == '键定位推荐·待复核' for r in short_rows))
+                else:
+                    self.assertTrue(all('键编号±5重合' in r[31] and '15个ID' not in r[31] for r in short_rows))  # Existing v1.1.17 decisions keep their evidence.
+                self.assertIsNone(rows[-1][29])
+                pure = self.values(result, '纯回填结果')[1:]
+                self.assertEqual([r[2] for r in pure if r[0] in {x[0] for x in short_rows}], translations)
+                book = load_workbook(result.destination / '回填日志.xlsx')
+                self.assertEqual(sum('15个ID' in str(row) for row in book.active.values), 4 if count == 4 else 0)
+                book.close()
+
+    def test_single_anchor_does_not_guess_ambiguous_or_incompatible_positions(self):
+        anchor = '这是一句可以确定位置的长台词'
+        self.workbook(self.source, [['台词', '한국어', '对话ID', '说话角色名'],
+            [anchor, '기준 대사', 100, '甲'], ['嗯。', '앞', None, '甲'], ['嗯！', '뒤', None, '甲']])
+        header = ['translationKey', 'chs', 'translate', 'speaker']
+        for roles in (('甲', '甲', '甲'), ('乙', '乙'), ('甲', '乙')):
+            with self.subTest(roles=roles):
+                self.workbook(self.baseline, [header,
+                    ['story_text_100_Dialog_Detail_v0', anchor, '旧', '甲'],
+                    *[[f'story_text_{101+i}_Dialog_Detail_v0', '嗯', '保留', role] for i, role in enumerate(roles)]])
+                result = self.run_match()
+                self.assertTrue(all('15个ID' not in str(r[31]) for r in self.values(result)[2:]))
+                # Three possible slots for two identical lines remain ambiguous.
+                if len(roles) == 3 or set(roles) == {'乙'}:
+                    self.assertTrue(all(r[29] is None for r in self.values(result)[2:]))
+                    self.assertEqual([r[2] for r in self.values(result, '纯回填结果')[2:]], ['保留'] * len(roles))
+        self.assertEqual(unique_alignment(['a', 'a'], ['x', 'a', 'a', 'x'], lambda a, b: a == b), [('a', 'a'), ('a', 'a')])
+        self.assertEqual(unique_alignment(['a', 'a'], ['a', 'a', 'a'], lambda a, b: a == b), [])
+        # Distinct positions, not equal values, determine uniqueness.
+        self.assertEqual(unique_alignment(['a'], [(1, 'a'), (2, 'a')], lambda a, b: a == b[1]), [])
+        self.assertEqual(unique_alignment(['a', 'b'], [(1, 'b'), (2, 'a')], lambda a, b: a == b[1]), [])
+
+    def test_single_anchor_keeps_prior_cross_file_claims_and_new_conflicts(self):
+        anchor = '这是一句可以确定位置的长台词'
+        header = ['台词', '한국어', '对话ID', '说话角色名']
+        self.workbook(self.source, [header, [anchor, '기준 대사', 100, '甲'],
+            *[['嗯。', f'新 {i}', None, '甲'] for i in range(4)]], name='a.xlsx')
+        self.workbook(self.baseline, [['translationKey', 'chs', 'translate', 'speaker'],
+            ['story_text_100_Dialog_Detail_v0', anchor, '旧', '甲'],
+            *[[f'story_text_{101+i}_Dialog_Detail_v0', '嗯', '保留', '甲'] for i in range(4)]])
+        self.workbook(self.source, [header, ['嗯。', '原有ID推荐', 101, '甲']], name='z.xlsx')
+        result = self.run_match()
+        rows = self.values(result)
+        self.assertEqual(rows[2][29], '原有ID推荐')
+        self.assertIn('对话ID与中文一致', rows[2][31])
+        self.assertEqual([r[29] for r in rows[3:]], ['新 1', '新 2', '新 3'])
+        book = load_workbook(result.destination / '匹配明细.xlsx')
+        self.assertTrue(any('未采用单侧补查' in str(r) for r in book['客户规则补匹配'].values))
+        book.close()
+        self.workbook(self.source, [header, [anchor, '기준 대사', 100, '甲'],
+            *[['嗯。', f'另一译文 {i}', None, '甲'] for i in range(4)]], name='z.xlsx')
+        result = self.run_match()
+        self.assertTrue(all(r[29] is None for r in self.values(result)[2:]))
+        self.assertEqual([r[2] for r in self.values(result, '纯回填结果')[2:]], ['保留'] * 4)
 
     def test_full_text_normalization_and_global_similarity(self):
         target = '她在树林深处遇到了一位正在寻找朋友的小妖精'

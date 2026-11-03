@@ -18,6 +18,7 @@ COMMENT_KEY = re.compile(r"(?:story_(?:(?:text|convenient)_)?\d+|char_voice_(?:w
 OPTION = re.compile(r"(?:^|\s)([A-Z]|\d{1,2})(?:[.．](?!\d)|[、:：;；,，])\s*")
 PLAYER = {"玩家", "主角", "主人公", "玩家(男)", "玩家(女)", "{playername}", "유저", "플레이어", "주인공", "男主角", "女主角", "星临者"}
 GENERIC_SPEAKERS = {"旁白", "系统", "系统说明", "系统文本", "系统提示", "群杂", "众人", "路人", "npc"}
+EDGE_MATCH = "客户规则：单侧顺序补查"
 
 
 def base(value):
@@ -140,6 +141,7 @@ def init_index(db):
         CREATE TABLE key_audit (source_id INTEGER,baseline_id INTEGER,method TEXT,similarity REAL,outcome TEXT);
         CREATE TABLE key_proposals (baseline_id INTEGER,source_id INTEGER,korean TEXT,method TEXT,similarity REAL,
             part INTEGER,total INTEGER,PRIMARY KEY(baseline_id,source_id,part));
+        CREATE TEMP TABLE key_edge_proposals AS SELECT * FROM key_proposals;
         CREATE TABLE fill_sheets (path TEXT,sheet TEXT,column_number INTEGER,header_row INTEGER,new_header TEXT,
             schema TEXT,PRIMARY KEY(path,sheet));
         CREATE TABLE fill_rows (path TEXT,sheet TEXT,row INTEGER,key TEXT,original TEXT,is_formula INTEGER,
@@ -215,6 +217,22 @@ def ordered_alignment(sources, targets, compatible):
         else:
             j -= 1
     return list(reversed(result))
+
+
+def unique_alignment(sources, targets, compatible):
+    """Accept a complete ordered match only when earliest/latest positions agree."""
+    def positions(reverse=False):
+        indexes = range(len(targets))
+        available = iter(reversed(indexes) if reverse else indexes)
+        found = []
+        for source in reversed(sources) if reverse else sources:
+            target = next((i for i in available if compatible(source, targets[i])), None)
+            if target is None:
+                return []
+            found.append(target)
+        return list(reversed(found)) if reverse else found
+    first, last = positions(), positions(True)
+    return [(r, targets[i]) for r, i in zip(sources, first)] if first and first == last else []
 
 
 def supplement(db, progress=None):
@@ -473,6 +491,39 @@ def supplement(db, progress=None):
             if best and (len(best) == 1 or best[0][0] > best[1][0]):
                 choose(r, best[0][1], label, best[0][0])
 
+        # The customer's edge-window pass also works with only one nearby anchor.
+        # Run after existing rules and require a unique complete alignment.
+        fixed = [-1, *[i for i, r in enumerate(sources) if firm(r)], len(sources)]
+        occupied = {r["chosen"]["id"] for r in sources if firm(r)}
+        for start, stop in zip(fixed, fixed[1:]):
+            a = sources[start]["chosen"] if start >= 0 else None
+            b = sources[stop]["chosen"] if stop < len(sources) else None
+            gap = [r for r in sources[start + 1:stop] if not r["excluded"] and
+                   not option_parts(r["chinese"]) and r["z"] and not r["no_slot"]]
+            if not gap or len(gap) > 15:
+                continue
+            if a and b and a["family"] and (a["path"], a["sheet"], a["family"]) == (b["path"], b["sheet"], b["family"]) and 0 < b["number"] - a["number"] <= 60:
+                continue  # Already handled by the two-anchor pass.
+            anchor = a if a and a["family"] else b if b and b["family"] else None
+            if anchor is None:
+                continue
+            forward = anchor is a
+            low, high = ((anchor["number"] + 1, anchor["number"] + 15) if forward else
+                         (anchor["number"] - 15, anchor["number"] - 1))
+            es = [e for e in records(db, """SELECT * FROM key_baselines
+                WHERE path=? AND sheet=? AND family=? AND number BETWEEN ? AND ? ORDER BY number,id""",
+                (anchor["path"], anchor["sheet"], anchor["family"], low, high)) if e["id"] not in occupied]
+            # A physically adjacent second anchor still bounds the scene even
+            # when its ID switches families or jumps backwards.
+            if a and b and (a["path"], a["sheet"]) == (b["path"], b["sheet"]):
+                if b["row"] <= a["row"]:
+                    continue
+                es = [e for e in es if a["row"] < e["row"] < b["row"]]
+            for r, e in unique_alignment(gap, es, same):
+                choose(r, e, f"{EDGE_MATCH}；{'前' if forward else '后'}侧确定键 {anchor['key']}，"
+                       f"{'向后' if forward else '向前'}15个ID内中文及顺序唯一对齐（{len(gap)}句）")
+                occupied.add(e["id"])
+
         for r in sources:
             if r["excluded"]:
                 db.execute("INSERT INTO key_audit VALUES (?,NULL,'',NULL,?)", (r["source_id"], r["excluded"]))
@@ -483,7 +534,8 @@ def supplement(db, progress=None):
                           "未定位：同中文候选不唯一" if r["cands"] else "未定位：没有满足中文、角色及相似度门槛的候选")
                 db.execute("INSERT INTO key_audit VALUES (?,NULL,?,NULL,?)", (r["source_id"], r["method"], reason))
             for e, korean, part, total in proposals:
-                db.execute("INSERT OR IGNORE INTO key_proposals VALUES (?,?,?,?,?,?,?)", (e["id"], r["source_id"], korean, r["method"], r["score"] if r["score"] is not None else 1.0, part, total))
+                table = "key_edge_proposals" if r["method"].startswith(EDGE_MATCH) else "key_proposals"
+                db.execute(f"INSERT OR IGNORE INTO {table} VALUES (?,?,?,?,?,?,?)", (e["id"], r["source_id"], korean, r["method"], r["score"] if r["score"] is not None else 1.0, part, total))
         if progress and index % 5 == 0:
             progress(f"客户规则补匹配：已处理 {index}/{len(sheets)} 张台本 Sheet")
     # Propagate only same-type, compatible duplicate keys. Short lines also need
@@ -506,6 +558,14 @@ def supplement(db, progress=None):
                 if not any(n and len(n[0]) >= 7 and db.execute("SELECT 1 FROM key_baselines WHERE path=? AND sheet=? AND row=? AND loose=?", (e["path"], e["sheet"], e["row"] + d, n[0])).fetchone() for d, n in zip((-1, 1), neighbours)):
                     continue
             db.execute("INSERT OR IGNORE INTO key_proposals VALUES (?,?,?,?,?,0,1)", (e["id"], p["source_id"], p["korean"], p["method"] + "；同类型、同角色重复键同步", p["similarity"]))
+    # Snapshot all old claims, including duplicate propagation, before inserting
+    # edge proposals. Preserve old results across source files; keep every new
+    # competing translation together rather than accepting whichever is first.
+    db.execute("INSERT INTO key_claimed SELECT DISTINCT baseline_id FROM key_proposals WHERE baseline_id NOT IN (SELECT baseline_id FROM key_claimed)")
+    db.execute("""INSERT INTO key_audit SELECT source_id,baseline_id,method,similarity,
+        '未采用单侧补查：此键已有客户定位候选，保留原判定' FROM key_edge_proposals
+        WHERE baseline_id IN (SELECT baseline_id FROM key_claimed)""")
+    db.execute("INSERT OR IGNORE INTO key_proposals SELECT * FROM key_edge_proposals WHERE baseline_id NOT IN (SELECT baseline_id FROM key_claimed)")
     return apply_proposals(db)
 
 

@@ -286,15 +286,43 @@ def supplement(db, progress=None):
             method += f"；角色别名（{r['speaker']}↔{e['speaker']}，{pairs[r['speaker'], e['speaker']]}个独立ID证据）"
         r.update(chosen=e, method=method, score=score)
 
+    def option_groups(bases):
+        groups = {}
+        for name in sorted(bases):
+            for e in records(db, "SELECT * FROM key_baselines WHERE option_base=? ORDER BY option_number,id", (name,)):
+                groups.setdefault((e["path"], e["sheet"], e["option_base"]), []).append(e)
+        return list(groups.values())
+
+    def resolve_options(r, groups, method, *, anchored=True):
+        parts, korean = r["parts"], option_parts(r["korean"])
+        texts = [content_key(z, parentheses=True) for z in parts]
+        def numbered(es):
+            return len(es) == len(parts) and [e["option_number"] for e in es] in (
+                list(range(len(parts))), list(range(1, len(parts) + 1)))
+        # An incomplete related group is still a possible location, not evidence
+        # that another scene is unique. A confirmed position also binds role/text.
+        groups = [es for es in groups if any(e["loose"] in texts for e in es) and
+                  (anchored or not numbered(es) or [e["loose"] for e in es] == texts)]
+        if not groups:
+            return False
+        if len(groups) == 1 and numbered(groups[0]) and [e["loose"] for e in groups[0]] == texts and all(allowed(r, e) for e in groups[0]):
+            r["options"] = list(zip(groups[0], korean))
+            r["method"] = method + f"；键编号 Option{groups[0][0]['option_number']}～Option{groups[0][-1]['option_number']}"
+        else:
+            r["method"] = method + (f"；对应{len(groups)}个相关选项组，位置不唯一，保留待确认" if len(groups) > 1 else
+                                     "；对应组含相关中文，但段数、连续编号、逐项中文或角色不符，不跨组选取，保留待确认")
+        return True
+
     sheets = db.execute("SELECT DISTINCT path,sheet FROM source_rows ORDER BY path,sheet").fetchall()
     for index, (path, sheet) in enumerate(sheets, 1):
         sources = [dict(r) for r in records(db, """SELECT m.*,s.chinese,s.korean,s.row,s.seq,
                     EXISTS(SELECT 1 FROM matched_sources u WHERE u.source_id=s.rowid) AS used FROM key_sources m
                     JOIN source_rows s ON s.rowid=m.source_id WHERE s.path=? AND s.sheet=? ORDER BY s.row""", (path, sheet))]
-        current_plot, plot_sequence, previous_id = "", 0, ""
+        current_plot, plot_sequence = "", 0
         for r in sources:
             r.update(z=content_key(r["chinese"], parentheses=True), chosen=None, method="", score=None, cands=[], options=[], no_slot=False)
             parts = option_parts(r["chinese"])
+            r["parts"] = parts
             if r["plot"].isdigit() and r["plot"] != current_plot:
                 current_plot, plot_sequence = r["plot"], 0
             elif r["plot"] and not r["plot"].isdigit():
@@ -307,29 +335,9 @@ def supplement(db, progress=None):
                 did = str(int(current_plot) * 100 + plot_sequence)
             r["effective_id"] = did
             if parts:
-                korean_parts = option_parts(r["korean"])
-                groups = []
-                opt_id = r["dialogue"] if r["dialogue"].isdigit() else previous_id
-                if opt_id:
-                    for family in ("story_text", "story_convenient"):
-                        es = list(records(db, "SELECT * FROM key_baselines WHERE option_base=? ORDER BY option_number,id", (f"{family}_{opt_id}",)))
-                        if es:
-                            groups.append(es)
-                if not groups:
-                    bases = {e["option_base"] for e in candidates(r, parts[0]) if e["option_base"]}
-                    groups = [list(records(db, "SELECT * FROM key_baselines WHERE option_base=? ORDER BY option_number,id", (b,))) for b in sorted(bases)]
-                groups = [es for es in groups if len(es) == len(parts) == len(korean_parts) and
-                          [e["option_number"] for e in es] in (list(range(len(parts))), list(range(1, len(parts) + 1))) and
-                          all(allowed(r, e) and content_key(z, parentheses=True) == e["loose"] for z, e in zip(parts, es))]
-                if len(groups) == 1:
-                    r["options"] = list(zip(groups[0], korean_parts))
-                    r["method"] = "客户规则：选项按 ID 键组及逐项中文定位" if opt_id else "客户规则：选项全部中文唯一键组"
-                    r["method"] += f"；键编号 Option{groups[0][0]['option_number']}～Option{groups[0][-1]['option_number']}"
-                else:
-                    r["method"] = "选项组、编号或中韩段数不唯一，保留待确认"
+                # Resolve after ordinary dialogue, including context/ID corrections.
                 continue
             if did:
-                previous_id = did
                 direct = list(records(db, "SELECT * FROM key_baselines WHERE key IN (?,?) ORDER BY id", tuple(f"{f}_{did}_Dialog_Detail_v0" for f in ("story_text", "story_convenient"))))
                 exact = [e for e in direct if allowed(r, e) and e["loose"] == r["z"]]
                 if exact and len({e["number"] for e in exact}) == 1:
@@ -359,7 +367,7 @@ def supplement(db, progress=None):
         # one or two extra digits. Require one table/sheet and explicit text evidence.
         blocks = {}
         for r in sources:
-            if r.get("effective_id") and not r["chosen"] and not r["excluded"] and not r["options"]:
+            if r.get("effective_id") and not r["chosen"] and not r["excluded"] and not r["parts"]:
                 blocks.setdefault(r["effective_id"], []).append(r)
         for did, group in blocks.items():
             es = list(records(db, """SELECT * FROM key_baselines WHERE family!=''
@@ -384,7 +392,7 @@ def supplement(db, progress=None):
         fixed = [i for i, r in enumerate(sources) if firm(r)]
         for start, stop in zip(fixed, fixed[1:]):
             a, b = sources[start]["chosen"], sources[stop]["chosen"]
-            gap = [r for r in sources[start + 1:stop] if not r["excluded"] and not r["options"] and r["z"]]
+            gap = [r for r in sources[start + 1:stop] if not r["excluded"] and not r["parts"] and r["z"]]
             if not gap or len(gap) > 60 or (a["path"], a["sheet"]) != (b["path"], b["sheet"]):
                 continue
             if a["family"] and a["family"] == b["family"] and 0 < b["number"] - a["number"] <= 60:
@@ -401,7 +409,7 @@ def supplement(db, progress=None):
         for _ in range(3):
             changed = 0
             for pos, r in enumerate(sources):
-                if firm(r) or r["excluded"] or r["options"] or r["no_slot"] or not r["cands"]:
+                if firm(r) or r["excluded"] or r["parts"] or r["no_slot"] or not r["cands"]:
                     continue
                 a, b = anchors(pos)
                 before = [x["z"] for x in sources[:pos] if not x["excluded"] and x["z"]][-3:]
@@ -443,7 +451,7 @@ def supplement(db, progress=None):
                  ("ID" in r["method"] or ("中文唯一" in r["method"] and len(r["z"]) >= 7))]
         for start, stop in zip(fixed, fixed[1:]):
             a, b = sources[start]["chosen"], sources[stop]["chosen"]
-            gap = [r for r in sources[start + 1:stop] if not r["excluded"] and r["cands"] and not r["options"] and not r["no_slot"]]
+            gap = [r for r in sources[start + 1:stop] if not r["excluded"] and r["cands"] and not r["parts"] and not r["no_slot"]]
             if not gap or len(gap) > 60 or (a["path"], a["sheet"]) != (b["path"], b["sheet"]) or not 0 < b["row"] - a["row"] <= 60:
                 continue
             es = list(records(db, "SELECT * FROM key_baselines WHERE path=? AND sheet=? AND row>? AND row<? AND family!='' ORDER BY row", (a["path"], a["sheet"], a["row"], b["row"])))
@@ -452,7 +460,7 @@ def supplement(db, progress=None):
                     choose(r, e, "客户规则：确定台词之间60行内流程校正")
 
         for pos, r in enumerate(sources):
-            if firm(r) or r["excluded"] or r["options"] or r["cands"] or r["used"] or not r["z"] or option_parts(r["chinese"]):
+            if firm(r) or r["excluded"] or r["parts"] or r["cands"] or r["used"] or not r["z"]:
                 continue
             a, b = anchors(pos)
             pool, threshold, label = [], .9, "客户规则：全表相似原文"
@@ -499,7 +507,7 @@ def supplement(db, progress=None):
             a = sources[start]["chosen"] if start >= 0 else None
             b = sources[stop]["chosen"] if stop < len(sources) else None
             gap = [r for r in sources[start + 1:stop] if not r["excluded"] and
-                   not option_parts(r["chinese"]) and r["z"] and not r["no_slot"]]
+                   not r["parts"] and r["z"] and not r["no_slot"]]
             if not gap or len(gap) > 15:
                 continue
             if a and b and a["family"] and (a["path"], a["sheet"], a["family"]) == (b["path"], b["sheet"], b["family"]) and 0 < b["number"] - a["number"] <= 60:
@@ -523,6 +531,37 @@ def supplement(db, progress=None):
                 choose(r, e, f"{EDGE_MATCH}；{'前' if forward else '后'}侧确定键 {anchor['key']}，"
                        f"{'向后' if forward else '向前'}15个ID内中文及顺序唯一对齐（{len(gap)}句）")
                 occupied.add(e["id"])
+
+        previous = None
+        for r in sources:
+            if r["excluded"]:
+                continue
+            if not r["parts"]:
+                previous = r
+                continue
+            korean = option_parts(r["korean"])
+            if len(korean) != len(r["parts"]):
+                r["method"] = f"选项中文{len(r['parts'])}段、韩语{len(korean)}段，编号或段数未对应，保留待确认"
+                continue
+            anchor = previous["chosen"] if previous else None
+            if r["dialogue"].isdigit():
+                explicit = option_groups({f"{f}_{r['dialogue']}" for f in ("story_text", "story_convenient")})
+                local = [es for es in explicit if anchor is not None and
+                         (es[0]["path"], es[0]["sheet"], es[0]["option_base"]) == (anchor["path"], anchor["sheet"], f"{anchor['family']}_{anchor['number']}")]
+                if resolve_options(r, local or explicit, "客户规则：选项按本行 ID 键组及逐项中文定位"):
+                    continue
+            if anchor is not None and anchor["family"]:
+                scoped = [es for es in option_groups({f"{anchor['family']}_{anchor['number']}"})
+                          if (es[0]["path"], es[0]["sheet"]) == (anchor["path"], anchor["sheet"])]
+                if resolve_options(r, scoped, f"客户规则：选项按已定位前句键 {anchor['key']}，同文件及Sheet逐项中文定位"):
+                    continue
+            elif previous and previous.get("effective_id"):
+                groups = option_groups({f"{f}_{previous['effective_id']}" for f in ("story_text", "story_convenient")})
+                if resolve_options(r, groups, "客户规则：选项按紧邻前句 ID 键组及逐项中文定位"):
+                    continue
+            groups = option_groups({e["option_base"] for part in r["parts"] for e in candidates(r, part) if e["option_base"]})
+            if not resolve_options(r, groups, "客户规则：选项全部中文唯一键组（ID未定位到有效组后回退）", anchored=False):
+                r["method"] = "没有中韩段数、连续编号、逐项中文及角色均对应的完整选项组，保留待确认"
 
         for r in sources:
             if r["excluded"]:
@@ -593,7 +632,9 @@ def apply_proposals(db):
             if p["part"]:
                 source = db.execute("SELECT path,sheet,row FROM source_rows WHERE rowid=?", (p["source_id"],)).fetchone()
                 db.execute("INSERT INTO structure_recommendations VALUES (?,?,?,?,?,?,?,?,?,?)", (*key, e["text"], p["korean"], f"{source[0]}；Sheet：{source[1]}；行号：{source[2]}；选项{p['part']}", basis, "选项推荐·待复核", "选项", f"选项{p['source_id']}"))
-                db.execute("INSERT INTO structure_sources VALUES (?,?,?,?,?,?,0)", (*key, p["source_id"], p["part"], p["total"]))
+                # Coverage shares zero-based segment positions with structural
+                # splits; proposals/UI keep 1-based options (0 means whole row).
+                db.execute("INSERT INTO structure_sources VALUES (?,?,?,?,?,?,0)", (*key, p["source_id"], p["part"] - 1, p["total"]))
                 db.execute("INSERT OR IGNORE INTO matched_sources VALUES (?)", (p["source_id"],))
                 variants = db.execute("""SELECT COUNT(*) FROM (SELECT s.korean_key FROM comparisons c
                     JOIN source_rows s ON s.rowid=c.source_id WHERE c.path=? AND c.sheet=? AND c.row=? AND s.korean_key!=''

@@ -196,6 +196,149 @@ class CustomerRules(unittest.TestCase):
         self.assertEqual(list(book['未推荐明细'].values)[1:], [])
         book.close()
 
+    def test_option_group_uses_located_previous_dialogue_without_source_id(self):
+        lead = '等下爹爹要是问起来，就按我的话锋见机行事，听到没有！'
+        self.workbook(self.source, [['对白文本', '한국어', '说话角色名'],
+            [lead, '이따 아버지가 물어보시면 눈치껏 대답해.', '韩幽幽'],
+            ['1、点头。\n2、摇头。', '1. 고개를 끄덕인다\n2. 고개를 젓는다', '{playerName}']])
+        self.workbook(self.baseline, [['Key', 'Text', 'TextTrans', 'Comment', 'Speaker'],
+            [1, lead, '旧台词', 'story_text_10322512_Dialog_Detail_v0', '韩幽幽'],
+            [2, '点头。', '旧点头', 'story_text_10322512_Option0_v0', '{playerName}'],
+            [3, '摇头。', '旧摇头', 'story_text_10322512_Option1_v0', '{playerName}'],
+            [4, '点头。', '另一场景点头', 'story_text_40100307_Option0_v0', '{playerName}'],
+            [5, '摇头。', '另一场景摇头', 'story_text_40100307_Option1_v0', '{playerName}']])
+        result = self.run_match()
+        rows = self.values(result)
+        self.assertEqual([r[29] for r in rows[2:4]], ['고개를 끄덕인다', '고개를 젓는다'])
+        self.assertTrue(all(r[32] == '选项推荐·待复核' and '10322512' in r[31] for r in rows[2:4]))
+        self.assertTrue(all(r[29] is None for r in rows[4:]))
+        self.assertEqual([r[2] for r in self.values(result, '纯回填结果')[2:]],
+                         ['고개를 끄덕인다', '고개를 젓는다', '另一场景点头', '另一场景摇头'])
+        book = load_workbook(result.destination / '匹配明细.xlsx')
+        self.assertEqual(list(book['未推荐明细'].values)[1:], [])
+        book.close()
+
+        # Removing the usable lead must not assign identical choices to either scene.
+        self.workbook(self.source, [['对白文本', '한국어', '说话角色名'],
+            ['1、点头。\n2、摇头。', '1. 고개를 끄덕인다\n2. 고개를 젓는다', '{playerName}']])
+        result = self.run_match()
+        self.assertTrue(all(r[29] is None for r in self.values(result)[2:]))
+        self.assertEqual([r[2] for r in self.values(result, '纯回填结果')[2:]],
+                         ['旧点头', '旧摇头', '另一场景点头', '另一场景摇头'])
+
+    def test_option_group_retries_unique_chinese_after_stale_id_group_rejected(self):
+        self.workbook(self.source, [['台词', '한국어', '对话ID', '说话角色名'],
+            ['这是此前另一段剧情中的台词', '이전 장면', 100, '甲'],
+            ['1、还没想好。\n2、有什么建议吗？', '1. 아직 못 정했어\n2. 좋은 생각 있어?', None, '{playerName}']])
+        self.workbook(self.baseline, [['Key', 'Text', 'TextTrans', 'Comment', 'Speaker'],
+            [1, '这是此前另一段剧情中的台词', '旧', 'story_text_100_Dialog_Detail_v0', '甲'],
+            [2, '这是旧选项甲', '保持甲', 'story_text_100_Option0_v0', '{playerName}'],
+            [3, '这是旧选项乙', '保持乙', 'story_text_100_Option1_v0', '{playerName}'],
+            [4, '还没想好', '旧一', 'story_text_10321610_Option0_v0', '{playerName}'],
+            [5, '有什么建议吗？', '旧二', 'story_text_10321610_Option1_v0', '{playerName}']])
+        result = self.run_match()
+        rows = self.values(result)
+        self.assertEqual([r[29] for r in rows[4:]], ['아직 못 정했어', '좋은 생각 있어?'])
+        self.assertTrue(all(r[32] == '选项推荐·待复核' and '中文' in r[31] and '选项按 ID' not in r[31] for r in rows[4:]))
+        self.assertEqual([r[2] for r in self.values(result, '纯回填结果')[2:]],
+                         ['保持甲', '保持乙', '아직 못 정했어', '좋은 생각 있어?'])
+
+    def test_option_group_waits_for_previous_dialogue_context_resolution(self):
+        anchor = '这是正式进入选择前的一段说明'
+        self.workbook(self.source, [['对白文本', '한국어', '说话角色名'],
+            [anchor, '먼저 설명한다', '甲'], ['好。', '좋아', '韩幽幽'],
+            ['1、点头。\n2、摇头。', '1. 고개를 끄덕인다\n2. 고개를 젓는다', '{playerName}']])
+        self.workbook(self.baseline, [['translationKey', 'chs', 'translate', 'speaker'],
+            ['story_text_10322511_Dialog_Detail_v0', anchor, '旧', '甲'],
+            ['story_text_10322512_Dialog_Detail_v0', '好。', '旧', '韩幽幽'],
+            ['story_text_10322512_Option0_v0', '点头。', '旧点头', '{playerName}'],
+            ['story_text_10322512_Option1_v0', '摇头。', '旧摇头', '{playerName}'],
+            ['story_text_40100307_Dialog_Detail_v0', '好。', '别处旧', '韩幽幽'],
+            ['story_text_40100307_Option0_v0', '点头。', '别处点头', '{playerName}'],
+            ['story_text_40100307_Option1_v0', '摇头。', '别处摇头', '{playerName}']])
+        result = self.run_match()
+        rows = self.values(result)
+        self.assertEqual([r[29] for r in rows[3:5]], ['고개를 끄덕인다', '고개를 젓는다'])
+        self.assertTrue(all(r[29] is None for r in rows[6:]))
+        self.assertTrue(all(r[32] == '选项推荐·待复核' for r in rows[3:5]))
+
+    def test_option_groups_never_join_across_sheets_or_workbooks(self):
+        self.workbook(self.source, [['台词', '한국어', '对话ID', '说话角色名'],
+            ['这里的选项有明确的台词编号', '앞 문장', 100, '甲'],
+            ['1、点头。\n2、摇头。', '1. 고개를 끄덕인다\n2. 고개를 젓는다', None, '{playerName}']])
+        headers = ['Key', 'Text', 'TextTrans', 'Comment', 'Speaker']
+        path = self.workbook(self.baseline, [headers,
+            [1, '这里的选项有明确的台词编号', '旧', 'story_text_100_Dialog_Detail_v0', '甲'],
+            [2, '点头。', '保持点头', 'story_text_100_Option0_v0', '{playerName}']])
+        for other_sheet in (True, False):
+            with self.subTest(other_sheet=other_sheet):
+                row = [3, '摇头。', '保持摇头', 'story_text_100_Option1_v0', '{playerName}']
+                if other_sheet:
+                    book = load_workbook(path); sheet = book.create_sheet('另一表')
+                    sheet.append(headers); sheet.append(row); book.save(path); book.close()
+                else:
+                    book = load_workbook(path); del book['另一表']; book.save(path); book.close()
+                    self.workbook(self.baseline, [headers, row], name='另一文件.xlsx')
+                result = self.run_match()
+                book = load_workbook(result.destination / '纯回填结果/table.xlsx')
+                self.assertEqual(book['正文']['C3'].value, '保持点头')
+                if other_sheet:
+                    self.assertEqual(book['另一表']['C2'].value, '保持摇头')
+                book.close()
+                if not other_sheet:
+                    self.assertEqual(self.values(result, '纯回填结果', '另一文件.xlsx')[1][2], '保持摇头')
+
+        # Complete copies are separate groups: the located dialogue identifies its own file.
+        self.workbook(self.baseline, [headers,
+            [1, '这里的选项有明确的台词编号', '旧', 'story_text_100_Dialog_Detail_v0', '甲'],
+            [2, '点头。', '保持点头', 'story_text_100_Option0_v0', '{playerName}'],
+            [3, '摇头。', '保持摇头', 'story_text_100_Option1_v0', '{playerName}']])
+        self.workbook(self.baseline, [headers,
+            [2, '点头。', '另一文件点头', 'story_text_100_Option0_v0', '{playerName}'],
+            [3, '摇头。', '另一文件摇头', 'story_text_100_Option1_v0', '{playerName}']], name='另一文件.xlsx')
+        result = self.run_match()
+        self.assertEqual([r[2] for r in self.values(result, '纯回填结果')[2:]], ['고개를 끄덕인다', '고개를 젓는다'])
+        self.assertEqual([r[2] for r in self.values(result, '纯回填结果', '另一文件.xlsx')[1:]], ['另一文件点头', '另一文件摇头'])
+
+    def test_relevant_invalid_option_group_blocks_unrelated_fallback(self):
+        lead = '这是已经明确定位的一段选项前台词'
+        source_header = ['台词', '한국어', '对话ID', '说话角色名']
+        header = ['translationKey', 'chs', 'translate', 'speaker']
+        options = ['1、点头。\n2、摇头。', '1. 고개를 끄덕인다\n2. 고개를 젓는다', None, '{playerName}']
+        invalid = {
+            '缺段': [(0, '点头。', '{playerName}')],
+            '缺首项': [(1, '摇头。', '{playerName}')],
+            '角色冲突': [(0, '点头。', '{playerName}'), (1, '摇头。', '另一角色')],
+            '重复编号': [(0, '点头。', '{playerName}'), (0, '摇头。', '{playerName}')],
+        }
+        for anchored, issue in ((True, '缺段'), (True, '角色冲突'), (True, '重复编号'),
+                                (False, '缺段'), (False, '缺首项'), (False, '重复编号')):
+            with self.subTest(anchored=anchored, issue=issue):
+                self.workbook(self.source, [source_header,
+                    *([[lead, '기준 대사', 100, '甲']] if anchored else []), options])
+                group = [[f'story_text_100_Option{n}_v0', text, f'本地保留{i}', speaker]
+                         for i, (n, text, speaker) in enumerate(invalid[issue])]
+                self.workbook(self.baseline, [header,
+                    ['story_text_100_Dialog_Detail_v0', lead, '旧台词', '甲'], *group,
+                    ['story_text_200_Option0_v0', '点头。', '别处点头', '{playerName}'],
+                    ['story_text_200_Option1_v0', '摇头。', '别处摇头', '{playerName}']])
+                result = self.run_match()
+                self.assertTrue(all(r[29] is None for r in self.values(result)[2:]))
+                self.assertEqual([r[2] for r in self.values(result, '纯回填结果')[2:]],
+                                 [r[2] for r in group] + ['别处点头', '别处摇头'])
+
+        # An independently located complete local group still wins over an incomplete copy elsewhere.
+        self.workbook(self.source, [source_header, [lead, '기준 대사', 100, '甲'], options])
+        self.workbook(self.baseline, [header,
+            ['story_text_100_Dialog_Detail_v0', lead, '旧台词', '甲'],
+            ['story_text_100_Option0_v0', '点头。', '旧点头', '{playerName}'],
+            ['story_text_100_Option1_v0', '摇头。', '旧摇头', '{playerName}']])
+        self.workbook(self.baseline, [header,
+            ['story_text_100_Option0_v0', '点头。', '另一文件保留', '{playerName}']], name='另一文件.xlsx')
+        result = self.run_match()
+        self.assertEqual([r[2] for r in self.values(result, '纯回填结果')[2:]], ['고개를 끄덕인다', '고개를 젓는다'])
+        self.assertEqual(self.values(result, '纯回填结果', '另一文件.xlsx')[1][2], '另一文件保留')
+
     def test_ordered_short_lines_and_same_key_translation_conflicts(self):
         self.workbook(self.source, [['台词', '한국어', '对话ID', '说话角色名'],
             ['开场！', '시작', 100, '甲'], ['嗯', '앞 음', None, '甲'], ['好的', '좋아', None, '甲'],

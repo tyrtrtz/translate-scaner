@@ -698,6 +698,58 @@ class StructureScanTests(unittest.TestCase):
         self.assertIn('已定位2/3段', unresolved[0][-1])
         self.assertEqual(hashes, {p: hashlib.sha256(p.read_bytes()).digest() for p in hashes})
 
+    def test_option_key_context_fills_repeated_split_choices_and_preserves_other_scene(self):
+        lead = '等下爹爹要是问起来，就按我的话锋见机行事，听到没有！'
+        source = self.workbook(self.source, [['对白文本', '한국어', '说话角色名'],
+            [lead, '이따 아버지가 물어보시면 눈치껏 대답해.', '韩幽幽'],
+            ['1、点头。\n2、摇头。', '1. 고개를 끄덕인다\n2. 고개를 젓는다', '{playerName}']])
+        baseline = self.workbook(self.baseline, [['Key', 'Text', 'TextTrans', 'Comment', 'Speaker'],
+            [1, lead, '旧台词', 'story_text_10322512_Dialog_Detail_v0', '韩幽幽'],
+            [2, '点头。', '旧点头', 'story_text_10322512_Option0_v0', '{playerName}'],
+            [3, '摇头。', '旧摇头', 'story_text_10322512_Option1_v0', '{playerName}'],
+            [4, '点头。', '另一场景点头', 'story_text_40100307_Option0_v0', '{playerName}'],
+            [5, '摇头。', '另一场景摇头', 'story_text_40100307_Option1_v0', '{playerName}']], name='story.xlsx')
+        hashes = {p: hashlib.sha256(p.read_bytes()).digest() for p in (source, baseline)}
+        result, _ = self.scan()
+        book = load_workbook(result.match_report.destination / '基准匹配结果/story.xlsx')
+        self.assertEqual([book.active.cell(row, 30).value for row in (3, 4)], ['고개를 끄덕인다', '고개를 젓는다'])
+        self.assertEqual([book.active.cell(row, 33).value for row in (3, 4)], ['选项推荐·待复核'] * 2)
+        self.assertTrue(all(book.active.cell(row, 30).value is None for row in (5, 6)))
+        book.close()
+        book = load_workbook(result.match_report.destination / '纯回填结果/story.xlsx')
+        self.assertEqual([book.active.cell(row, 3).value for row in (3, 4, 5, 6)],
+                         ['고개를 끄덕인다', '고개를 젓는다', '另一场景点头', '另一场景摇头'])
+        book.close()
+        self.assertEqual(hashes, {p: hashlib.sha256(p.read_bytes()).digest() for p in hashes})
+
+    def test_option_key_pass_completes_punctuation_gap_without_replacing_existing_split(self):
+        self.workbook(self.source, [['对白文本', '한국어', '说话角色名', '对话ID'],
+            ['这是前一段剧情中的长台词', '이전 장면의 대사', '甲', 100],
+            ['喂喂，你打算用什么菜来应战。', '그래서 무슨 요리로 맞설 생각이야?', '露米', None],
+            ['1、还没想好。\n2、有什么建议吗？', '1. 아직 못 정했어\n2. 좋은 생각 있어?', '{playerName}', None]])
+        self.workbook(self.baseline, [['Key', 'Text', 'TextTrans', 'Comment', 'Speaker'],
+            [1, '喂喂，你打算用什么菜来应战。', '旧台词', 'story_text_10321610_Dialog_Detail_v0', '露米'],
+            [2, '还没想好', '旧一', 'story_text_10321610_Option0_v0', '{playerName}'],
+            [3, '有什么建议吗？', '旧二', 'story_text_10321610_Option1_v0', '{playerName}'],
+            [4, '这是前一段剧情中的长台词', '旧台词', 'story_text_100_Dialog_Detail_v0', '甲'],
+            [5, '这是旧选项甲', '保持旧选项甲', 'story_text_100_Option0_v0', '{playerName}'],
+            [6, '这是旧选项乙', '保持旧选项乙', 'story_text_100_Option1_v0', '{playerName}']], name='story.xlsx')
+        result, _ = self.scan()
+        book = load_workbook(result.match_report.destination / '基准匹配结果/story.xlsx')
+        self.assertEqual(book.active['AD3'].value, '아직 못 정했어')
+        self.assertEqual(book.active['AG3'].value, '选项推荐·待复核')
+        self.assertEqual(book.active['AD4'].value, '좋은 생각 있어?')
+        self.assertEqual(book.active['AG4'].value, '拆分推荐·待复核')
+        self.assertIn('v1.1.9规则优先', book.active['AF4'].value)
+        book.close()
+        book = load_workbook(result.match_report.destination / '纯回填结果/story.xlsx')
+        self.assertEqual([book.active.cell(row, 3).value for row in (3, 4)], ['아직 못 정했어', '좋은 생각 있어?'])
+        self.assertEqual([book.active.cell(row, 3).value for row in (6, 7)], ['保持旧选项甲', '保持旧选项乙'])
+        book.close()
+        book = load_workbook(result.match_report.destination / '匹配明细.xlsx')
+        self.assertEqual(list(book['未推荐明细'].values)[1:], [])
+        book.close()
+
     def test_legacy_merge_and_split_take_priority_over_new_punctuation_whole_matches(self):
         self.workbook(self.source, [
             ['台词', '한국어'], ['前锚', '앞'], ['甲…', '가...'], ['乙！', '나!'], ['后锚', '뒤'],

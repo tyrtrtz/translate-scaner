@@ -4,9 +4,10 @@ import re
 import shutil
 from pathlib import Path
 from zipfile import ZipFile
+from xml.etree.ElementTree import fromstring, iterparse
 from xml.sax.expatreader import create_parser
 from xml.sax.handler import feature_external_ges
-from xml.sax.saxutils import XMLGenerator
+from xml.sax.saxutils import XMLGenerator, escape
 
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter, column_index_from_string
@@ -39,10 +40,87 @@ def prepare_values(db):
     db.commit()
 
 
+def prepare_strings(source, part, db, path):
+    """Index only pending fill text on disk; keep existing SST indices stable."""
+    db.execute("CREATE TEMP TABLE IF NOT EXISTS fill_strings (value TEXT PRIMARY KEY,string_index INTEGER)")
+    db.execute("DELETE FROM fill_strings")
+    db.execute("INSERT OR IGNORE INTO fill_strings(value) SELECT value FROM fill_values WHERE path=?", (str(path),))
+    db.execute("INSERT OR IGNORE INTO fill_strings(value) SELECT new_header FROM fill_sheets WHERE path=? AND new_header!=''", (str(path),))
+    size = 0
+    with source.open(part) as stream:
+        elements = iterparse(stream, events=("start", "end"))
+        _, root = next(elements)
+        namespace = root.tag[:-3]  # expanded name of sst, including the closing brace
+        for event, element in elements:
+            if event == "end" and element.tag == namespace + "si":
+                # Do not reuse a rich-text entry: its run formatting belongs to
+                # the old cells. Leave it and every old index intact.
+                if len(element) == 1 and element[0].tag == namespace + "t":
+                    value = element[0].text or ""
+                    if not re.search(r"_x[0-9A-Fa-f]{4}_", value):
+                        db.execute("UPDATE fill_strings SET string_index=? WHERE value=? AND string_index IS NULL", (size, value))
+                size += 1
+                root.remove(element)
+    for index, (value,) in enumerate(db.execute("SELECT value FROM fill_strings WHERE string_index IS NULL ORDER BY value"), size):
+        db.execute("UPDATE fill_strings SET string_index=? WHERE value=?", (index, value))
+    return size
+
+
+class SharedStringsWriter(XMLGenerator):
+    """Stream the original SST, appending new plain strings before extLst."""
+
+    def __init__(self, stream, db, original_size, count_delta):
+        super().__init__(stream, encoding="utf-8")
+        self.db, self.original_size, self.count_delta = db, original_size, count_delta
+        self.prefix = ""
+        self.appended = False
+
+    def startElement(self, name, attrs):
+        local = name.rsplit(":", 1)[-1]
+        if local == "sst":
+            self.prefix = name[:-3]
+            attrs = dict(attrs)
+            if "count" in attrs and "uniqueCount" in attrs:
+                added = self.db.execute("SELECT COUNT(*) FROM fill_strings WHERE string_index>=?", (self.original_size,)).fetchone()[0]
+                attrs.update(count=str(int(attrs["count"]) + self.count_delta), uniqueCount=str(self.original_size + added))
+            else:
+                # Both optional counts must be present together.
+                attrs.pop("count", None)
+                attrs.pop("uniqueCount", None)
+        elif name == self.prefix + "extLst":
+            self.append_strings()
+        super().startElement(name, attrs)
+
+    def characters(self, content):
+        if "\r" in content:
+            self._finish_pending_start_element()
+            self._write(escape(content, {"\r": "&#13;"}))
+        else:
+            super().characters(content)
+
+    def append_strings(self):
+        if self.appended:
+            return
+        self.appended = True
+        for (value,) in self.db.execute("SELECT value FROM fill_strings WHERE string_index>=? ORDER BY string_index", (self.original_size,)):
+            super().startElement(self.prefix + "si", {})
+            super().startElement(self.prefix + "t", {"xml:space": "preserve"})
+            # Escape literal OOXML control tokens only in newly appended text.
+            # Existing SST entries already have their original encoding.
+            self.characters(re.sub(r"_(x[0-9A-Fa-f]{4}_)", r"_x005F_\1", value))
+            super().endElement(self.prefix + "t")
+            super().endElement(self.prefix + "si")
+
+    def endElement(self, name):
+        if name == self.prefix + "sst":
+            self.append_strings()
+        super().endElement(name)
+
+
 class BackfillWriter(BaselineWriter):
     """Reuse literal-safe XML emission, replacing only the intended cell."""
 
-    def __init__(self, stream, db, path, sheet, column, header_row, new_header):
+    def __init__(self, stream, db, path, sheet, column, header_row, new_header, shared_strings=False):
         super().__init__(stream, db, path, sheet, header_row, column)
         self.target = column
         self.new_header = new_header
@@ -50,16 +128,25 @@ class BackfillWriter(BaselineWriter):
         self.value = None
         self.written = False
         self.checking = False
+        self.shared_strings = shared_strings
+        self.shared_count_delta = 0
 
     def emit(self, attrs=None):
         attrs = dict(attrs or {})
-        attrs.update(r=f"{get_column_letter(self.target)}{self.row}", t="inlineStr")
+        self.shared_count_delta += int(self.shared_strings and attrs.get("t") != "s")
+        attrs.update(r=f"{get_column_letter(self.target)}{self.row}", t="s" if self.shared_strings else "inlineStr")
         XMLGenerator.startElement(self, self.prefix + "c", attrs)
-        XMLGenerator.startElement(self, self.prefix + "is", {})
-        XMLGenerator.startElement(self, self.prefix + "t", {"xml:space": "preserve"})
-        self.xml_characters(self.value)
-        XMLGenerator.endElement(self, self.prefix + "t")
-        XMLGenerator.endElement(self, self.prefix + "is")
+        if self.shared_strings:
+            index = self.connection.execute("SELECT string_index FROM fill_strings WHERE value=?", (self.value,)).fetchone()[0]
+            XMLGenerator.startElement(self, self.prefix + "v", {})
+            self.xml_characters(str(index))
+            XMLGenerator.endElement(self, self.prefix + "v")
+        else:
+            XMLGenerator.startElement(self, self.prefix + "is", {})
+            XMLGenerator.startElement(self, self.prefix + "t", {"xml:space": "preserve"})
+            self.xml_characters(self.value)
+            XMLGenerator.endElement(self, self.prefix + "t")
+            XMLGenerator.endElement(self, self.prefix + "is")
         XMLGenerator.endElement(self, self.prefix + "c")
         self.written = True
 
@@ -128,18 +215,32 @@ class BackfillWriter(BaselineWriter):
 def write_copy(path, destination, db, parts):
     destination.parent.mkdir(parents=True, exist_ok=True)
     with ZipFile(path) as source, ZipFile(destination, "w") as output:
+        shared_part = next((e.attrib["PartName"].lstrip("/") for e in fromstring(source.read("[Content_Types].xml"))
+                            if e.attrib.get("ContentType", "").endswith(".sharedStrings+xml")), None)
+        original_size = prepare_strings(source, shared_part, db, path) if shared_part else 0
+        count_delta = 0
         for item in source.infolist():
+            if item.filename == shared_part:
+                continue
             with source.open(item) as original, output.open(item, "w") as copied:
                 if item.filename in parts:
                     sheet = parts[item.filename][0]
                     column, header, new_header = db.execute("SELECT column_number,header_row,new_header FROM fill_sheets WHERE path=? AND sheet=?", (str(path), sheet)).fetchone()
-                    writer = BackfillWriter(copied, db, path, sheet, column, header, new_header)
+                    writer = BackfillWriter(copied, db, path, sheet, column, header, new_header, bool(shared_part))
                     parser = create_parser()
                     parser.setFeature(feature_external_ges, False)
                     parser.setContentHandler(writer)
                     parser.parse(original)
+                    count_delta += writer.shared_count_delta
                 else:
                     shutil.copyfileobj(original, copied, length=1024 * 1024)
+        if shared_part:
+            with source.open(shared_part) as original, output.open(source.getinfo(shared_part), "w") as copied:
+                writer = SharedStringsWriter(copied, db, original_size, count_delta)
+                parser = create_parser()
+                parser.setFeature(feature_external_ges, False)
+                parser.setContentHandler(writer)
+                parser.parse(original)
 
 
 def write_log(destination, db, baseline_root, progress=None):
@@ -151,6 +252,7 @@ def write_log(destination, db, baseline_root, progress=None):
         ["范围", "纯回填结果与基准匹配结果保留相同目录、文件名、Sheet、行号；纯回填不追加匹配分析列。"],
         ["写入", "成功推荐（含待复核推荐）按推荐列相同的首尾换行规则写入 TextTrans／translate；未推荐、缺译保留原值。"],
         ["保护", "原件不修改；已有译文公式保留并记录。缺少 TextTrans 时在表头末尾新增，若该列已有未标名数据则停止生成，防止覆盖。"],
+        ["字符串格式", "原基准有 sharedStrings 时，回填译文及新增表头也使用共享索引，保留原索引及富文本；原本为 inlineStr 的基准保持原方式。"],
         ["交叉核对", "先按键及文件/Sheet定位；双方均明确回填或确认且原始译文完全一致，可列为双方一致。双方都未回填、仅沿用原值，不能据此定稿。"],
         ["格式差异", "与客户工具比对时，须区分文字差异、标签、字面\\n与实际换行、|变体及自动字幕折行。此输出不擅自复制客户工具的格式改写。"],
     ], [24, 110])
